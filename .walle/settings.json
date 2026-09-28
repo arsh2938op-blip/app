@@ -1,0 +1,11 @@
+{
+  "robotName": "WALL-E",
+  "host": null,
+  "port": 8080,
+  "connectionMethod": "mdns",
+  "autoReconnect": true,
+  "motorSpeed": 0.6,
+  "volume": 0.7,
+  "demoMode": true,
+  "cameraEnabled": false
+}
