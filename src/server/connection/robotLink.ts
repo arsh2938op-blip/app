@@ -15,6 +15,7 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
 import {
+  CLIFF,
   CMD,
   DEFAULT_ROBOT_PORT,
   ERR,
@@ -40,6 +41,12 @@ import {
 } from "../../shared/walleProtocol.js";
 import type { ConnectionState, RobotStatus } from "../../shared/walleTypes.js";
 import { EMPTY_STATUS } from "../../shared/walleTypes.js";
+
+/**
+ * The reasons WALL-E can refuse to move. Each has exactly one way to clear,
+ * which is why the cause is tracked rather than the message.
+ */
+type BlockCause = "cliff" | "sensor-fault" | "voice" | "link-timeout";
 
 export interface RobotLinkOptions {
   reconnect: { enabled: boolean; minDelayMs: number; maxDelayMs: number };
@@ -93,12 +100,22 @@ export class RobotLink extends EventEmitter {
   /** The direction currently held by the operator, if any. */
   private heldCommand: number | null = null;
 
+  /**
+   * Why the robot will not move right now.
+   *
+   * Tracked as a cause rather than as a message, because the clear rules must
+   * not depend on the wording: matching on the text meant a block raised by an
+   * ERROR frame could never be lifted when the sensor recovered, leaving the
+   * UI showing a fault that no longer existed.
+   */
+  private blockCause: BlockCause | null = null;
+  private blockMessage: string | null = null;
+
   private status: RobotStatus = { ...EMPTY_STATUS };
 
   /** When true, the operator is driving; keeps the watchdog fed. */
   private driving = false;
   /** Set when the robot refuses movement because it is talking. */
-  private blockedReason: string | null = null;
 
   constructor(private readonly opts: RobotLinkOptions) {
     super();
@@ -122,7 +139,7 @@ export class RobotLink extends EventEmitter {
   }
 
   get blocked(): string | null {
-    return this.blockedReason;
+    return this.blockMessage;
   }
 
   /* ------------------------------------------------------------ *
@@ -278,9 +295,14 @@ export class RobotLink extends EventEmitter {
         break;
 
       case ST.ACK:
-        // An ack means the robot took the command; drop any block notice.
-        if (this.blockedReason) this.setBlocked(null);
-        this.emit("ack", p.cmd === ST.ACK ? p.value : p.cmd);
+        // An ack means the robot accepted the command, so any refusal it was
+        // blocking on is over. Sensor blocks are exempt: a robot can ack a
+        // non-motion command while still refusing to drive, and clearing the
+        // sensor block here would hide a real edge.
+        if (this.blockCause === "link-timeout" || this.blockCause === "voice") {
+          this.setBlocked(this.blockCause, null);
+        }
+        this.emit("ack", p.value);
         if (isMotionCommand(p.value)) this.driving = true;
         break;
 
@@ -315,29 +337,29 @@ export class RobotLink extends EventEmitter {
 
   private onRefusal(code: number): void {
     const message = errorMessage(code);
+    this.emit("refused", code, message);
 
     // LINK_TIMEOUT is the robot complaining about US, not refusing a command.
     // Re-arm the keepalive rather than tearing the connection down.
     if (code === ERR.LINK_TIMEOUT) {
-      this.emit("refused", code, message);
-      this.setBlocked(message);
       this.driving = false;
       this.heldCommand = null;
+      this.setBlocked("link-timeout", message);
       this.emit("log", "warn", `${message} — resuming keepalive`);
       return;
     }
 
     // CLIFF and SENSOR_FAULT are a stop condition, not a retry condition.
+    // Both clear as soon as the sensor reports safe again, which is handled
+    // in applyCliff() — the cause is what links the two, not the wording.
     if (code === ERR.CLIFF || code === ERR.SENSOR_FAULT) {
-      this.emit("refused", code, message);
-      this.setBlocked(message);
       this.driving = false;
       this.heldCommand = null;
+      this.setBlocked(code === ERR.CLIFF ? "cliff" : "sensor-fault", message);
       this.emit("log", "warn", message);
       return;
     }
 
-    this.emit("refused", code, message);
     this.emit("log", "warn", message);
   }
 
@@ -359,9 +381,10 @@ export class RobotLink extends EventEmitter {
     });
 
     if (blocked) {
-      this.setBlocked("WALL-E is thinking or speaking — wheels locked");
-    } else if (this.blockedReason?.includes("wheels locked")) {
-      this.setBlocked(null);
+      this.setBlocked("voice", "WALL-E is thinking or speaking — wheels locked");
+    } else {
+      // A state change away from THINKING/SPEAKING lifts the voice block.
+      this.clearBlocked("voice");
     }
 
     // The robot left REMOTE, so a held direction is over even if the
@@ -384,10 +407,17 @@ export class RobotLink extends EventEmitter {
       this.driving = false;
       this.heldCommand = null;
       this.setBlocked(
-        value === 3 ? "WALL-E stopped: no floor ahead" : "WALL-E stopped: sensor not responding",
+        value === CLIFF.DROP ? "cliff" : "sensor-fault",
+        value === CLIFF.DROP
+          ? "WALL-E stopped: no floor ahead"
+          : "WALL-E stopped: sensor not responding",
       );
-    } else if (this.blockedReason?.includes("WALL-E stopped")) {
-      this.setBlocked(null);
+    } else {
+      // A safe reading lifts either sensor-related block, whichever raised it.
+      // This is the path that also clears a block set by an ERROR frame, so
+      // the UI cannot get stuck showing a fault the robot has recovered from.
+      this.clearBlocked("cliff");
+      this.clearBlocked("sensor-fault");
     }
   }
 
@@ -403,11 +433,21 @@ export class RobotLink extends EventEmitter {
    * silently will not move. The server republishes state on the event, so
    * the UI explains the refusal without waiting for the next unrelated
    * status frame to happen to arrive.
+   *
+   * A new cause always replaces an old one: the most recent reason is the
+   * one the operator needs to act on.
    */
-  private setBlocked(reason: string | null): void {
-    if (this.blockedReason === reason) return;
-    this.blockedReason = reason;
-    this.emit("blocked", reason);
+  private setBlocked(cause: BlockCause, message: string | null): void {
+    if (this.blockCause === cause && this.blockMessage === message) return;
+    this.blockCause = cause;
+    this.blockMessage = message;
+    this.emit("blocked", message);
+  }
+
+  /** Lift a block, but only if `cause` is the reason currently in force. */
+  private clearBlocked(cause: BlockCause): void {
+    if (this.blockCause !== cause) return;
+    this.setBlocked(cause, null);
   }
 
   private setState(state: ConnectionState, error?: { code: string; message: string }): void {

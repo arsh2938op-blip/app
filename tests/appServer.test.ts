@@ -120,6 +120,36 @@ describe("AppServer in demo mode", () => {
     server.mockRef?.setCliff(CLIFF.GROUND, 12);
   });
 
+  /**
+   * Polling is disabled for the cliff tests.
+   *
+   * A read_sensor issued just before the test injects a fault can still be in
+   * flight, and its reply carries the reading from *before* the fault. That
+   * stale SENSOR frame then clears the block the test is waiting for, and the
+   * test fails depending on where the poller happened to be. Silencing the
+   * poller leaves only traffic the test caused, so the assertions mean what
+   * they say.
+   *
+   * The change goes through the HTTP settings route rather than writing the
+   * store directly, because that route is what restarts the poll timer.
+   */
+  const withoutPolling = async (fn: () => Promise<void>) => {
+    const setPoll = (ms: number) =>
+      fetch(`http://127.0.0.1:${port}/api/settings`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sensorPollMs: ms }),
+      }).then((r) => r.json() as Promise<{ sensorPollMs: number }>);
+
+    const original = server.settingsRef.get().sensorPollMs;
+    await setPoll(0);
+    try {
+      await fn();
+    } finally {
+      await setPoll(original);
+    }
+  };
+
   it("rejects an app socket with the wrong token", async () => {
     await expect(openClient(port, "nope")).rejects.toBeTruthy();
   });
@@ -241,32 +271,43 @@ describe("AppServer in demo mode", () => {
   });
 
   it("surfaces a cliff refusal and blocks movement", async () => {
-    const c = await connected();
-    server.mockRef!.setCliff(CLIFF.DROP, 44);
-    // Wording comes from the firmware's own error table.
-    expect(await until(() => (lastState(c)?.blocked ?? "").match(/edge/i), 5000)).toBeDefined();
-    c.send("drive", { command: CMD.MOVE_FORWARD, held: true });
-    expect(await until(() => hasActivity(c, /stopped at the edge/), 4000)).toBe(true);
-    // The block must clear on its own once the floor is back, otherwise the
-    // UI would keep refusing to drive after the robot is safe again.
-    server.mockRef!.setCliff(CLIFF.GROUND, 12);
-    expect(await until(() => lastState(c)?.blocked === null, 5000)).toBeDefined();
-    c.close();
+    await withoutPolling(async () => {
+      const c = await connected();
+      server.mockRef!.setCliff(CLIFF.DROP, 44);
+      // Wording comes from the firmware's own error table.
+      expect(await until(() => (lastState(c)?.blocked ?? "").match(/edge/i), 5000)).toBeDefined();
+      c.send("drive", { command: CMD.MOVE_FORWARD, held: true });
+      expect(await until(() => hasActivity(c, /stopped at the edge/), 4000)).toBe(true);
+      // The block must clear on its own once the floor is back, otherwise the
+      // UI would keep refusing to drive after the robot is safe again.
+      server.mockRef!.setCliff(CLIFF.GROUND, 12);
+      expect(await until(() => lastState(c)?.blocked === null, 5000)).toBeDefined();
+      c.close();
+    });
   });
 
   it("republishes state when a block clears, not only when one appears", async () => {
     // A stale "blocked" banner that never clears is worse than no banner:
     // the operator would think WALL-E is broken.
-    const c = await connected();
-    server.mockRef!.setCliff(CLIFF.FAULT, 0);
-    expect(await until(() => /sensor/i.test(lastState(c)?.blocked ?? ""), 5000)).toBeDefined();
+    await withoutPolling(async () => {
+      const c = await connected();
+      server.mockRef!.setCliff(CLIFF.FAULT, 0);
+      expect(await until(() => /sensor/i.test(lastState(c)?.blocked ?? ""), 5000)).toBeDefined();
 
-    const before = c.msgs.length;
-    server.mockRef!.setCliff(CLIFF.GROUND, 12);
-    expect(await until(() => lastState(c)?.blocked === null, 5000)).toBeDefined();
-    // A state frame was pushed after the clear, with no command sent.
-    expect(c.msgs.length).toBeGreaterThan(before);
-    c.close();
+      // Remember where the client is in the stream, then clear the fault and
+      // require a frame arriving AFTER that point to carry the clear. This
+      // asserts the republish itself rather than a message count, which would
+      // otherwise depend on how often a sensor poll happened to fire.
+      const mark = c.msgs.length;
+      server.mockRef!.setCliff(CLIFF.GROUND, 12);
+
+      const cleared = await until(
+        () => c.msgs.slice(mark).some((m) => m.type === SERVER_MSG.STATE && m.blocked === null),
+        5000,
+      );
+      expect(cleared).toBeDefined();
+      c.close();
+    });
   });
 
   it("rejects an unknown command", async () => {

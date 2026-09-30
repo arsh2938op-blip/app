@@ -9,3 +9,14 @@ coverage/
 
 .walle/
 
+
+android/local.properties
+android/app/build/
+android/build/
+android/.gradle/
+android/capacitor-cordova-android-plugins/
+
+
+# Built artifact; regenerate with npm run android:apk
+wall-e-debug.apk
+

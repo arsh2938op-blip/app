@@ -244,6 +244,37 @@ describe("RobotLink against the mock robot", () => {
     l.drive(CMD.STOP, false);
   });
 
+  it("clears a fault block raised by an ERROR frame, not only by a status frame", async () => {
+    // The block used to be cleared by matching text in the message, so a
+    // block set from the robot's ERROR frame outlived the fault: the UI kept
+    // claiming a dead sensor long after the robot was safe again.
+    const l = await connected();
+    const refusals: number[] = [];
+    l.on("refused", (code) => refusals.push(code));
+
+    robot.setCliff(CLIFF.FAULT, 0);
+    await until(() => refusals.includes(ERR.SENSOR_FAULT), 3000);
+    expect(l.blocked).not.toBeNull();
+
+    // A safe reading must lift it, even though the fault was reported as an
+    // error rather than as a CLIFF status frame.
+    robot.setCliff(CLIFF.GROUND, 12);
+    await until(() => l.blocked === null, 3000);
+    expect(l.blocked).toBeNull();
+  });
+
+  it("keeps a sensor block while the fault persists, despite acks", async () => {
+    // An ACK for a harmless command must not hide a real edge.
+    const l = await connected();
+    robot.setCliff(CLIFF.DROP, 44);
+    await until(() => l.blocked !== null, 3000);
+
+    l.simple(CMD.DANCE);
+    l.simple(CMD.IDLE);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(l.blocked).not.toBeNull();
+  });
+
   it("refuses a movement command while a cliff is detected", async () => {
     const l = await connected();
     const refusals: number[] = [];

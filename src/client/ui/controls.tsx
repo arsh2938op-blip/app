@@ -2,7 +2,7 @@
  * Driving controls: the joystick plus the timed-motion and safety buttons.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   CMD,
   MAX_STEPS,
@@ -11,6 +11,7 @@ import {
   type CommandId,
 } from "../../shared/walleProtocol.js";
 import {
+  api,
   dance,
   driveEnd,
   driveStart,
@@ -116,13 +117,22 @@ export function DrivePanel() {
  */
 export function TimedMotionPanel() {
   const connected = useStore((s) => s.connection === "connected");
-  const steps = useStore((s) => s.settings?.stepCount ?? 4);
+  const saved = useStore((s) => s.settings?.stepCount ?? 4);
+  // Local copy while dragging, so the slider tracks the finger instead of
+  // waiting on a round trip to the companion server.
+  const [steps, setSteps] = useState(saved);
   const [degrees, setDegrees] = useState(90);
   const [sent, setSent] = useState<string | null>(null);
+
+  useEffect(() => setSteps(saved), [saved]);
 
   const flash = (msg: string) => {
     setSent(msg);
     window.setTimeout(() => setSent(null), 2500);
+  };
+
+  const commitSteps = () => {
+    void api.saveSettings({ stepCount: steps }).catch(() => {});
   };
 
   return (
@@ -131,7 +141,7 @@ export function TimedMotionPanel() {
       <p className="hint">These stop by themselves. No keepalive needed.</p>
 
       <div className="form-row">
-        <label htmlFor="steps">Steps ({estimateStepDistanceCm(steps)} cm)</label>
+        <label htmlFor="steps">Steps — about {estimateStepDistanceCm(steps)} cm</label>
         <input
           id="steps"
           type="range"
@@ -140,15 +150,11 @@ export function TimedMotionPanel() {
           step={1}
           value={steps}
           disabled={!connected}
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            void fetch("/api/settings", {
-              method: "PUT",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ stepCount: v }),
-            });
-          }}
+          onChange={(e) => setSteps(Number(e.target.value))}
+          onPointerUp={commitSteps}
+          onKeyUp={commitSteps}
         />
+        <span className="hint">Open loop: the robot times the distance, it does not measure it.</span>
       </div>
       <div className="btn-row">
         <button

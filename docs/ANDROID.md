@@ -1,122 +1,108 @@
-# Building the Android APK
+﻿# Building the APK
 
-The app is a React web UI wrapped in a native Android shell with Capacitor.
-The UI is byte-for-byte the same code that runs in a browser — Capacitor only
-provides the APK.
+The Android build needs three things: the Android SDK, a JDK that Gradle
+accepts, and a working `sdk.dir`. The third one is the trap.
 
----
+## The `local.properties` trap
 
-## What you get
+AGP on Windows mis-parses `android/local.properties`. When the `sdk.dir` value
+is not treated as absolute, AGP falls back to
+`File(rootDir, path).canonicalFile`, and on Windows that concatenation throws
+error 123. The build dies with:
 
-```bash
+```
+Could not determine the dependencies of task ':app:compileDebugJavaWithJavac'
+  > java.io.IOException: The filename, directory name, or volume label syntax is incorrect
+```
+
+The message names neither the file nor the setting, and the stack points deep
+inside Gradle, so it is easy to lose a day to it.
+
+**Fix: point at the SDK with `ANDROID_HOME` and do not use
+`local.properties`.**
+
+```powershell
+$env:ANDROID_HOME = "C:\Users\<you>\AppData\Local\Android\Sdk"
+```
+
+`node scripts/use-sdk.mjs` locates the SDK and clears the offending file:
+
+```powershell
+node scripts/use-sdk.mjs
+```
+
+It prints the path to export. With no argument it searches the usual
+locations and prints the first one that has `platforms/` and `build-tools/`.
+
+## JDK version
+
+Gradle does not run on JDK 25. Use **JDK 17 or 21**:
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
+```
+
+Capacitor's generated project pins Gradle 8.2.1 and AGP 8.2.1, which work on
+JDK 17.
+
+## Full sequence
+
+```powershell
+$env:ANDROID_HOME = "C:\Users\<you>\AppData\Local\Android\Sdk"
+$env:JAVA_HOME   = "C:\Program Files\Java\jdk-17"
+
+node scripts/use-sdk.mjs     # clear local.properties
+npm install
 npm run android:apk
 ```
 
-→ `android/app/build/outputs/apk/debug/app-debug.apk`
+Output:
 
-Install it:
-
-```bash
-adb install -d android/app/build/outputs/apk/debug/app-debug.apk
+```
+android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-or copy the APK to the phone and open it (enable *install from unknown
-sources*).
+Install with `adb install -d <path>`, or copy the file to the phone and open
+it after enabling *install from unknown sources*.
 
----
+## Verified
 
-## Prerequisites
+Built and inspected on this machine:
 
-| Tool | Version | Notes |
-|---|---|---|
-| Node | 20+ | already required |
-| JDK | 17 or 21 | **Gradle does not support JDK 25 yet** |
-| Android SDK | platform 34, build-tools 34 | Android Studio installs this |
-| Gradle | 8.7 | fetched automatically by the wrapper |
-
-> **JDK version matters.** If `java -version` reports 25, the Gradle wrapper
-> will refuse to run. Point `JAVA_HOME` at a 17 or 21 install:
->
-> ```powershell
-> $env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
-> ```
-
-If Android Studio is installed, the SDK is already there and
-`android/local.properties` just needs the path:
-
-```properties
-sdk.dir=C:\Users\<you>\AppData\Local\Android\Sdk
-```
-
----
-
-## Without Android Studio
-
-Install the command-line tools, then let Gradle use them:
-
-```powershell
-# 1. command-line tools
-New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA\android\cmdline-tools
-#    download commandlinetools-win-*_latest.zip from
-#    https://developer.android.com/studio#command-line-tools-only
-#    unzip so that sdkmanager.bat ends up at
-#      $env:LOCALAPPDATA\android\cmdline-tools\latest\bin\sdkmanager.bat
-
-# 2. packages
-$sdk = "$env:LOCALAPPDATA\android\sdk"
-& "$env:LOCALAPPDATA\android\cmdline-tools\latest\bin\sdkmanager.bat" --sdk_root=$sdk --licenses
-& "$env:LOCALAPPDATA\android\cmdline-tools\latest\bin\sdkmanager.bat" --sdk_root=$sdk "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
-# 3. point the project at the SDK
-"sdk.dir=$sdk" | Out-File -Encoding ascii android\local.properties
-```
-
-Then `npm run android:apk`.
-
----
+- package `innovationday.walle.app`, label `WALL-E`
+- minSdk 22, targetSdk 34, compileSdk 34
+- permissions: INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE, WAKE_LOCK
+- the built UI is packaged under `assets/public/`
+- 3.8 MB debug APK
 
 ## How the app connects
 
 The phone runs the UI. The **companion server** on the laptop is what speaks
-TCP to the robot. Both must be running:
+TCP to the robot, because a browser cannot open a raw TCP socket. Both must be
+running:
 
-```bash
-npm run dev:server   # on the laptop
-npm run dev:client   # or install the APK and use that
+```powershell
+npm run dev:server   # laptop
 ```
 
-The APK bundles the built UI, so it does not need Vite. It does need to reach
-the companion server over the local network.
-
-**To use the phone with no laptop**, run the companion server on an always-on
-machine and point the app at its address. The app's server URL is baked in at
-build time via the Capacitor `server.url` setting in
-`capacitor.config.ts` — leave it unset to use the bundled assets plus a
-runtime server address, which is the default.
+The APK bundles the built UI, so it does not need Vite. To use the phone
+entirely on its own, run the companion server on an always-on machine.
 
 ### Cleartext HTTP
 
 The companion server speaks plain HTTP and WebSocket on the LAN, where there
 is no certificate authority, so `android:usesCleartextTraffic="true"` is set
-in the manifest. That is acceptable for a demo bench on a trusted network and
-**should be replaced with TLS before this goes anywhere real.**
+in the manifest. That is acceptable on a trusted demo network and **should be
+replaced with TLS before this goes anywhere real.**
 
----
+## Release signing
 
-## Release build
-
-```bash
-npm run android:release
-```
-
-Needs a signing key. Create one:
-
-```bash
-keytool -genkey -v -keystore walle-release.keystore \
+```powershell
+keytool -genkey -v -keystore walle-release.keystore `
   -alias walle -keyalg RSA -keysize 2048 -validity 10000
 ```
 
-Then create `android/keystore.properties` (git-ignored):
+`android/keystore.properties` (git-ignored):
 
 ```properties
 storeFile=../walle-release.keystore
@@ -148,49 +134,41 @@ android {
 
 Never commit the keystore or its passwords.
 
----
-
 ## App identity
 
 | | |
 |---|---|
 | Package | `innovationday.walle.app` |
 | Name | WALL-E |
-| Orientation | full sensor — portrait and landscape both work |
-| Min SDK | Capacitor 6 default (23) |
-| Target SDK | 34 |
+| Orientation | full sensor, portrait and landscape |
 
-Changing the package name or launcher label is a matter of
-`capacitor.config.ts` plus a re-sync, not a code change.
-
----
+Changing either is a `capacitor.config.ts` edit plus a re-sync.
 
 ## Screen wake lock
 
-The app requests a screen wake lock while visible, and the manifest declares
-`WAKE_LOCK`. This is a **safety requirement, not a convenience**: the robot
-stops itself if the app goes quiet for 700 ms, and Android will lock an idle
-screen within seconds. A locked screen means a silent app, which means a robot
-that stops in the middle of a manoeuvre.
-
-The app also releases the joystick on `visibilitychange` and on window blur,
-so a genuine background still stops the robot cleanly.
-
----
+The app requests a screen wake lock and the manifest declares `WAKE_LOCK`.
+This is a **safety requirement, not a convenience**: the robot stops itself
+if the app goes quiet for 700 ms, and Android locks an idle screen within
+seconds. A locked screen means a silent app, which means a robot that stops
+mid-manoeuvre. The app also releases the joystick on `visibilitychange` and on
+window blur, so a genuine background still stops cleanly.
 
 ## Troubleshooting
 
-**`Unsupported class file major version` / Gradle fails on JDK 25**
+**`Unsupported class file major version`**
 Set `JAVA_HOME` to JDK 17 or 21.
 
 **`SDK location not found`**
-Create `android/local.properties` with `sdk.dir=<path to sdk>`.
+Export `ANDROID_HOME`, and run `node scripts/use-sdk.mjs`.
+
+**`filename, directory name, or volume label syntax is incorrect`**
+You have a `local.properties` with a `sdk.dir` in it. Delete it and use
+`ANDROID_HOME` instead.
 
 **APK installs but shows a blank screen**
-The build ran before the client was built. `npm run android:apk` builds it
-first; if you ran `npx cap sync` alone, run `npm run build` and sync again.
+The build ran before the client was built. `npm run android:apk` builds first;
+if you ran `npx cap sync` alone, run `npm run build` and sync again.
 
 **App cannot reach the server**
-Check the phone and laptop are on the same network, and that the server bound
-to `0.0.0.0` (the default) rather than `127.0.0.1`. Android also blocks
-cleartext HTTP by default, which the manifest override handles.
+Phone and computer must be on the same network, and the server must have bound
+to `0.0.0.0` (the default) rather than `127.0.0.1`.
