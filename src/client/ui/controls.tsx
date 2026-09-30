@@ -1,134 +1,219 @@
-import { useEffect, useState } from "react";
-import { useStore, sendCommand } from "../store.js";
-import { COMMANDS, type ExpressionName } from "../../shared/protocol.js";
-import { HoldButton } from "./common.js";
+/**
+ * Driving controls: the joystick plus the timed-motion and safety buttons.
+ */
 
-const EXPRESSION_EMOJI: Record<string, string> = {
-  neutral: "😐",
-  happy: "😄",
-  sad: "🙁",
-  confused: "😕",
-  surprised: "😲",
-  thinking: "🤔",
-  listening: "👂",
-  speaking: "🗣️",
-  idle: "😌",
-};
+import { useState } from "react";
+import {
+  CMD,
+  MAX_STEPS,
+  MAX_TURN_DEGREES,
+  estimateStepDistanceCm,
+  type CommandId,
+} from "../../shared/walleProtocol.js";
+import {
+  dance,
+  driveEnd,
+  driveStart,
+  emergencyStop,
+  explore,
+  joke,
+  moveSteps,
+  readSensor,
+  setAutonomous,
+  setExpression,
+  setIdle,
+  talk,
+  turnAround,
+  turnDegrees,
+  useStore,
+} from "../store.js";
+import { Joystick, type StickDirection } from "./Joystick.js";
 
-const TEST_EXPRESSIONS: ExpressionName[] = [
-  "happy",
-  "confused",
-  "surprised",
-  "thinking",
-  "listening",
-  "speaking",
-  "idle",
-];
+const EXPRESSIONS = [
+  { label: "Happy", command: CMD.EXPR_HAPPY, emoji: "😄" },
+  { label: "Confused", command: CMD.EXPR_CONFUSED, emoji: "😕" },
+  { label: "Surprised", command: CMD.EXPR_SURPRISED, emoji: "😲" },
+  { label: "Thinking", command: CMD.EXPR_THINKING, emoji: "🤔" },
+  { label: "Idle", command: CMD.EXPR_IDLE, emoji: "😌" },
+] as const;
 
-export function MovementPanel() {
+export function DrivePanel() {
   const connected = useStore((s) => s.connection === "connected");
-  const moving = useStore((s) => s.moving);
-  const motorSpeed = useStore((s) => s.status?.motorSpeed ?? 0.6);
-  const autonomous = useStore((s) => s.status?.autonomous ?? false);
+  const blocked = useStore((s) => s.blocked);
+  const driving = useStore((s) => s.driving);
+  const [dir, setDir] = useState<StickDirection | null>(null);
 
-  // In manual mode a held direction must end in an explicit stop, otherwise
-  // the robot drives off the table. In autonomous mode WALL-E owns movement.
-  const stopOnRelease = !autonomous;
-
-  const stop = () => sendCommand({ command: COMMANDS.STOP, payload: {} });
-  const drive = (command: typeof COMMANDS.MOVE_FORWARD | typeof COMMANDS.MOVE_BACKWARD | typeof COMMANDS.TURN_LEFT | typeof COMMANDS.TURN_RIGHT | typeof COMMANDS.ROTATE_LEFT | typeof COMMANDS.ROTATE_RIGHT) =>
-    sendCommand({ command, payload: { speed: motorSpeed } });
+  const hold = (command: CommandId) => ({
+    onPointerDown: (e: React.PointerEvent) => {
+      if (!connected) return;
+      e.preventDefault();
+      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+      driveStart(command);
+    },
+    onPointerUp: () => driveEnd(),
+    onPointerCancel: () => driveEnd(),
+  });
 
   return (
-    <div className="card col-6">
-      <h2>Movement</h2>
-      <div className="dpad">
-        <div className="spacer" />
-        <HoldButton
-          label="Forward"
-          disabled={!connected}
-          onPress={() => drive(COMMANDS.MOVE_FORWARD)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
-        />
-        <div className="spacer" />
+    <div className="card col-7 drive-card">
+      <h2>Drive</h2>
 
-        <HoldButton
-          label="Left"
+      {blocked ? (
+        <div className="notice warn" role="status">
+          {blocked}
+        </div>
+      ) : null}
+
+      <div className="drive-layout">
+        <div className="joystick-column">
+          <Joystick disabled={!connected} onDirection={setDir} />
+        </div>
+
+        <div className="drive-side">
+          <button className="stop" disabled={!connected} onClick={emergencyStop}>
+            STOP
+          </button>
+          <p className="hint">
+            {blocked
+              ? "WALL-E will not move while it is talking or near an edge."
+              : driving || dir
+                ? `Driving — ${dir ?? "forward"}`
+                : "Push the stick to drive. Lift to stop."}
+          </p>
+
+          <div className="mini-row">
+            <span className="mini-label">Quick turn</span>
+            <div className="btn-row">
+              <button disabled={!connected} {...hold(CMD.ROTATE_LEFT)}>
+                ↺ Left
+              </button>
+              <button disabled={!connected} {...hold(CMD.ROTATE_RIGHT)}>
+                ↻ Right
+              </button>
+            </div>
+          </div>
+
+          <div className="mini-row">
+            <span className="mini-label">Straight ahead</span>
+            <div className="btn-row">
+              <button disabled={!connected} {...hold(CMD.MOVE_FORWARD)}>
+                ▲ Forward
+              </button>
+              <button disabled={!connected} {...hold(CMD.MOVE_BACKWARD)}>
+                ▼ Back
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Timed motions. These finish by themselves, so there is no keepalive and no
+ * stop afterwards — the robot is doing the timing, not the operator.
+ */
+export function TimedMotionPanel() {
+  const connected = useStore((s) => s.connection === "connected");
+  const steps = useStore((s) => s.settings?.stepCount ?? 4);
+  const [degrees, setDegrees] = useState(90);
+  const [sent, setSent] = useState<string | null>(null);
+
+  const flash = (msg: string) => {
+    setSent(msg);
+    window.setTimeout(() => setSent(null), 2500);
+  };
+
+  return (
+    <div className="card col-5">
+      <h2>Timed moves</h2>
+      <p className="hint">These stop by themselves. No keepalive needed.</p>
+
+      <div className="form-row">
+        <label htmlFor="steps">Steps ({estimateStepDistanceCm(steps)} cm)</label>
+        <input
+          id="steps"
+          type="range"
+          min={1}
+          max={MAX_STEPS}
+          step={1}
+          value={steps}
           disabled={!connected}
-          onPress={() => drive(COMMANDS.TURN_LEFT)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            void fetch("/api/settings", {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ stepCount: v }),
+            });
+          }}
         />
-        <button className="stop" disabled={!connected} onClick={stop}>
-          STOP
+      </div>
+      <div className="btn-row">
+        <button
+          disabled={!connected}
+          onClick={() => {
+            moveSteps(steps);
+            flash(`Driving ${steps} steps`);
+          }}
+        >
+          Move {steps} steps
         </button>
-        <HoldButton
-          label="Right"
+        <button
           disabled={!connected}
-          onPress={() => drive(COMMANDS.TURN_RIGHT)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
-        />
-
-        <div className="spacer" />
-        <HoldButton
-          label="Back"
-          disabled={!connected}
-          onPress={() => drive(COMMANDS.MOVE_BACKWARD)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
-        />
-        <div className="spacer" />
+          onClick={() => {
+            turnAround();
+            flash("Turning around");
+          }}
+        >
+          ↻ Turn around
+        </button>
       </div>
 
-      <div className="hold-row">
-        <HoldButton
-          label="↺ Rotate Left"
+      <div className="form-row" style={{ marginTop: 12 }}>
+        <label htmlFor="deg">Turn — {degrees}°</label>
+        <input
+          id="deg"
+          type="range"
+          min={1}
+          max={MAX_TURN_DEGREES}
+          step={5}
+          value={degrees}
           disabled={!connected}
-          onPress={() => drive(COMMANDS.ROTATE_LEFT)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
-        />
-        <HoldButton
-          label="↻ Rotate Right"
-          disabled={!connected}
-          onPress={() => drive(COMMANDS.ROTATE_RIGHT)}
-          onHold={() => {}}
-          onRelease={() => stopOnRelease && stop()}
+          onChange={(e) => setDegrees(Number(e.target.value))}
         />
       </div>
+      <button
+        disabled={!connected}
+        onClick={() => {
+          turnDegrees(degrees);
+          flash(`Turning ${degrees}°`);
+        }}
+      >
+        Turn {degrees}°
+      </button>
 
-      <p className="hint" style={{ marginBottom: 0 }}>
-        {autonomous
-          ? "Autonomous Mode is on — WALL-E chooses its own movements."
-          : moving
-            ? "Moving — release a direction to stop."
-            : "Hold a direction to drive, release to stop."}
-      </p>
+      {sent ? <p className="hint ok">{sent}</p> : null}
     </div>
   );
 }
 
 export function ExpressionPanel() {
   const connected = useStore((s) => s.connection === "connected");
-  const current = useStore((s) => s.status?.expression ?? "neutral");
-
   return (
-    <div className="card col-6">
+    <div className="card col-4">
       <h2>Expression</h2>
-      <div className="expr-face" aria-hidden>
-        {EXPRESSION_EMOJI[current] ?? "😐"}
-      </div>
       <div className="expressions">
-        {TEST_EXPRESSIONS.map((expression) => (
+        {EXPRESSIONS.map((e) => (
           <button
-            key={expression}
+            key={e.label}
             disabled={!connected}
-            aria-pressed={current === expression}
-            onClick={() => sendCommand({ command: COMMANDS.SET_EXPRESSION, payload: { expression } })}
+            onClick={() => setExpression(e.command)}
           >
-            <span aria-hidden>{EXPRESSION_EMOJI[expression] ?? ""}</span> {expression}
+            <span aria-hidden>{e.emoji}</span>
+            <br />
+            {e.label}
           </button>
         ))}
       </div>
@@ -139,45 +224,42 @@ export function ExpressionPanel() {
 export function ModesPanel() {
   const connected = useStore((s) => s.connection === "connected");
   const status = useStore((s) => s.status);
-  const autonomous = status?.autonomous ?? false;
+  const [dancing, setDancing] = useState(false);
+  const [exploring, setExploring] = useState(false);
 
-  // Local mirror so the button reacts on tap; the robot's own events correct it.
-  const [danceLatched, setDanceLatched] = useState(false);
-  const [exploreLatched, setExploreLatched] = useState(false);
-
-  useEffect(() => {
-    setDanceLatched(status?.state === "dancing");
-    setExploreLatched(status?.state === "exploring");
-  }, [status?.state]);
+  const state = status?.state;
+  const autonomous = state === "exploring";
 
   return (
-    <div className="card col-6">
+    <div className="card col-4">
       <h2>Modes</h2>
       <div className="modes">
         <button
           className="primary"
-          disabled={!connected || danceLatched}
+          disabled={!connected || dancing}
           onClick={() => {
-            setDanceLatched(true);
-            sendCommand({ command: COMMANDS.DANCE, payload: {} });
+            setDancing(true);
+            dance();
           }}
         >
-          {danceLatched ? "Dancing…" : "Dance"}
+          {dancing ? "Dancing…" : "Dance"}
         </button>
-
         <button
-          disabled={!connected || exploreLatched}
+          disabled={!connected || exploring}
           onClick={() => {
-            setExploreLatched(true);
-            sendCommand({ command: COMMANDS.EXPLORE, payload: {} });
+            setExploring(true);
+            explore();
           }}
         >
-          {exploreLatched ? "Exploring…" : "Explore"}
+          {exploring ? "Exploring…" : "Explore"}
+        </button>
+        <button disabled={!connected} onClick={setIdle}>
+          Idle
         </button>
 
         <div className="switch-row">
           <div>
-            <strong>Autonomous Mode</strong>
+            <strong>Autonomous</strong>
             <div className="hint">WALL-E decides its own movements</div>
           </div>
           <button
@@ -186,21 +268,29 @@ export function ModesPanel() {
             aria-checked={autonomous}
             aria-label="Autonomous mode"
             disabled={!connected}
-            onClick={() =>
-              sendCommand({
-                command: COMMANDS.SET_AUTONOMOUS,
-                payload: { enabled: !autonomous },
-              })
-            }
+            onClick={() => setAutonomous(!autonomous)}
           />
         </div>
+      </div>
+    </div>
+  );
+}
 
-        <button
-          className="ghost"
-          disabled={!connected}
-          onClick={() => sendCommand({ command: COMMANDS.IDLE, payload: {} })}
-        >
-          Idle
+export function VoiceQuickPanel() {
+  const connected = useStore((s) => s.connection === "connected");
+  return (
+    <div className="card col-4">
+      <h2>Say something</h2>
+      <p className="hint">WALL-E picks the words and speaks them out loud.</p>
+      <div className="btn-row">
+        <button disabled={!connected} onClick={talk}>
+          Talk to me
+        </button>
+        <button disabled={!connected} onClick={joke}>
+          Tell a joke
+        </button>
+        <button disabled={!connected} onClick={readSensor}>
+          Read sensor
         </button>
       </div>
     </div>

@@ -1,456 +1,499 @@
 /**
- * In-process mock of the ESP32-C3 firmware.
+ * In-process simulator of the ESP32-S3 WALL-E robot.
  *
- * Speaks the exact WALL-E Robot API v1 wire format over a real WebSocket
- * server, so the app can be developed, demoed and tested with no hardware.
- * This is the reference implementation the firmware is validated against.
+ * Speaks the real binary protocol over a real TCP server, so the app, the
+ * framing code and the command semantics are all exercised exactly as they
+ * will be against the hardware. It also reproduces the robot's safety rules,
+ * because a simulator that let you drive off a table would be worse than
+ * useless for a demo.
  */
 
-import { createServer, type Server } from "node:http";
-import { WebSocketServer, type WebSocket } from "ws";
+import net from "node:net";
 import {
-  COMMANDS,
-  DEFAULT_ROBOT_PORT,
-  ERROR_CODES,
-  EXPRESSIONS,
-  makeCommand,
-  makeEvent,
-  makeResponse,
-  type CommandEnvelope,
-  type ExpressionName,
-  type RobotState,
-  type RobotStatus,
-} from "../shared/protocol.js";
-import { parseWireMessage } from "../shared/validate.js";
-
-const DEMO_TRANSCRIPTS = [
-  "Tell me a joke.",
-  "What can you do?",
-  "Who are you?",
-  "Do you see anything?",
-];
-
-const DEMO_REPLIES = [
-  "Why did the robot cross the road? To reach the other charging station! Ha ha!",
-  "I can drive, dance, tell expressions, and talk. Pick any button on the screen!",
-  "I am WALL-E. I am a compacting robot with a camera and a very curious mind!",
-  "I see a floor, a wall, and one very interesting dustbin.",
-];
+  CLIFF,
+  CMD,
+  ERR,
+  FLAG_HELD,
+  FrameReader,
+  MAGIC,
+  MSG_TYPE,
+  ROBOT_STATE,
+  ST,
+  VERSION,
+  cliffIsDangerous,
+  encodePacket,
+  robotStateName,
+  wheelsBlockedByVoice,
+  type DecodedPacket,
+} from "../shared/walleProtocol.js";
 
 export interface MockRobotOptions {
   port?: number;
   host?: string;
-  /** Advertise over mDNS so discovery can be exercised too. */
-  advertise?: boolean;
   name?: string;
-  firmwareVersion?: string;
-  onCommand?: (cmd: CommandEnvelope) => void;
+  /** Override the cliff sensor, e.g. to rehearse an edge refusal on stage. */
+  cliff?: number;
+  groundCm?: number;
+  onPacket?: (p: DecodedPacket) => void;
 }
 
+const SAMPLE_NOMINAL_GROUND_CM = 12;
+
 export class MockRobot {
-  private http: Server | null = null;
-  private wss: WebSocketServer | null = null;
-  private bonjour: { destroy: () => void } | null = null;
-  private client: WebSocket | null = null;
+  private server: net.Server | null = null;
+  private client: net.Socket | null = null;
+  private reader = new FrameReader();
+  private txSeq = 0;
 
-  private readonly status: RobotStatus;
-  private state: RobotState = "idle";
-  private expression: ExpressionName = "neutral";
-  private autonomous = false;
+  private state: number = ROBOT_STATE.IDLE;
+  private heldFromApp: number | null = null;
+  private appLastRx = 0;
+  private watchdogTimer: NodeJS.Timeout | null = null;
   private danceTimer: NodeJS.Timeout | null = null;
+  private maneuverTimer: NodeJS.Timeout | null = null;
+  private ttsTimer: NodeJS.Timeout | null = null;
   private exploreTimer: NodeJS.Timeout | null = null;
-  private movementTimer: NodeJS.Timeout | null = null;
-  private transcriptIndex = 0;
-  private readonly started = Date.now();
-  private readonly opts: Required<Pick<MockRobotOptions, "port" | "host" | "name" | "firmwareVersion">> &
-    MockRobotOptions;
+  private stateTimer: NodeJS.Timeout | null = null;
+  private pendingTextCmd: number | null = null;
 
-  constructor(opts: MockRobotOptions = {}) {
-    this.opts = {
-      port: opts.port ?? DEFAULT_ROBOT_PORT,
-      host: opts.host ?? "0.0.0.0",
-      name: opts.name ?? "WALL-E",
-      firmwareVersion: opts.firmwareVersion ?? "1.0.0-mock",
-      advertise: opts.advertise ?? false,
-      onCommand: opts.onCommand,
-    };
-    this.status = {
-      name: this.opts.name,
-      firmwareVersion: this.opts.firmwareVersion,
-      ip: "127.0.0.1",
-      mac: "AA:BB:CC:DD:EE:FF",
-      wifiRssi: -48,
-      uptimeMs: 0,
-      state: "idle",
-      expression: "neutral",
-      mode: "manual",
-      autonomous: false,
-      motorSpeed: 0.6,
-      volume: 0.7,
-      freeHeap: 142_336,
-      cameraAvailable: true,
-    };
+  private cliff: number;
+  private groundCm: number;
+
+  constructor(private readonly opts: MockRobotOptions = {}) {
+    this.cliff = opts.cliff ?? CLIFF.GROUND;
+    this.groundCm = opts.groundCm ?? SAMPLE_NOMINAL_GROUND_CM;
   }
 
   async start(): Promise<number> {
-    this.http = createServer((_req, res) => {
-      res.writeHead(200, { "content-type": "text/plain" });
-      res.end("WALL-E mock robot\n");
-    });
-    this.wss = new WebSocketServer({ server: this.http });
+    this.server = net.createServer((socket) => this.onConnection(socket));
+    await new Promise<void>((done) =>
+      this.server!.listen(this.opts.port ?? 0, this.opts.host ?? "127.0.0.1", done),
+    );
+    const addr = this.server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
 
-    this.wss.on("connection", (socket) => {
-      this.client = socket;
-      this.pushEvent(makeEvent({ event: "robot_booted", payload: { firmwareVersion: this.opts.firmwareVersion } }));
-      this.pushEvent(makeEvent({ event: "robot_ready", payload: { status: this.snapshot() } }));
-
-      socket.on("message", (raw) => this.handleFrame(raw.toString()));
-      socket.on("close", () => {
-        if (this.client === socket) this.client = null;
-        this.stopMovement();
-      });
-      socket.on("error", () => this.stopMovement());
-    });
-
-    await new Promise<void>((done) => this.http!.listen(this.opts.port, this.opts.host, done));
-    const addr = this.http.address();
-    const port = typeof addr === "object" && addr ? addr.port : this.opts.port;
-    this.status.ip = this.opts.host === "0.0.0.0" ? "127.0.0.1" : this.opts.host;
-
-    if (this.opts.advertise) this.advertise(port);
+    // The real robot pushes its state about once a second as a keepalive
+    // floor, and the integration doc explicitly warns the app not to treat
+    // every one of those as a screen update. The simulator does the same so
+    // that behaviour is developed against.
+    this.stateTimer = setInterval(() => this.sendStatus(ST.ROBOT_STATE, this.state), 1000);
     return port;
   }
 
-  private advertise(port: number): void {
-    // Imported lazily so the mock stays usable in environments without mdns.
-    import("bonjour-service")
-      .then(({ Bonjour }) => {
-        const bonjour = new Bonjour();
-        bonjour.publish({
-          name: this.opts.name,
-          type: "walle",
-          port,
-          txt: { name: this.opts.name, fw: this.opts.firmwareVersion, model: "esp32-c3" },
-        });
-        this.bonjour = bonjour;
-      })
-      .catch(() => {
-        /* discovery is optional */
-      });
+  private onConnection(socket: net.Socket): void {
+    this.client = socket;
+    socket.setNoDelay(true);
+    this.reader.reset();
+    this.heldFromApp = null;
+    this.appLastRx = Date.now();
+
+    // The robot greets a new controller immediately.
+    this.sendStatus(ST.WELCOME, this.state);
+    this.startWatchdog();
+
+    socket.on("data", (chunk) => this.ingest(chunk));
+    socket.on("close", () => {
+      if (this.client === socket) this.client = null;
+      this.releaseWheels("app disconnected");
+      this.stopWatchdog();
+    });
+    socket.on("error", () => this.releaseWheels("socket error"));
   }
 
-  private handleFrame(text: string): void {
-    const parsed = parseWireMessage(text);
-    if (!parsed.ok) {
-      // Even a rejected frame gets a reply, correlated to the sender's own
-      // requestId where one can be recovered.
-      this.push(
-        makeResponse(extractRequestId(text) ?? "unknown", false, undefined, {
-          code: parsed.code as (typeof ERROR_CODES)[keyof typeof ERROR_CODES],
-          message: parsed.message,
-        }),
-      );
-      return;
+  private ingest(chunk: Buffer): void {
+    const { packets, texts } = this.reader.feed(new Uint8Array(chunk));
+    for (const p of packets) {
+      this.appLastRx = Date.now();
+      this.onPacket(p);
     }
-    if (parsed.value.type !== "command") return;
-    const cmd = parsed.value as CommandEnvelope;
-    this.opts.onCommand?.(cmd);
-    this.execute(cmd);
+    for (const t of texts) {
+      this.appLastRx = Date.now();
+      this.onTextFrame(t.op, t.text);
+    }
   }
 
-  private execute(cmd: CommandEnvelope): void {
-    const { command: name, requestId, payload } = cmd as CommandEnvelope & {
-      payload: Record<string, unknown>;
-    };
-    const ok = () => {
-      this.push(makeResponse(requestId, true));
-      this.pushStatus();
-    };
-    const fail = (code: string, message: string) =>
-      this.push(makeResponse(requestId, false, undefined, { code, message }));
+  /* ------------------------------------------------------------ *
+   * Command handling
+   * ------------------------------------------------------------ */
 
-    switch (name) {
-      case COMMANDS.MOVE_FORWARD:
-      case COMMANDS.MOVE_BACKWARD:
-      case COMMANDS.TURN_LEFT:
-      case COMMANDS.TURN_RIGHT:
-      case COMMANDS.ROTATE_LEFT:
-      case COMMANDS.ROTATE_RIGHT: {
-        const duration = typeof payload.duration === "number" ? payload.duration : 600;
-        const speed = typeof payload.speed === "number" ? payload.speed : this.status.motorSpeed;
-        this.stopMovement();
-        this.setState("moving");
-        this.pushEvent(
-          makeEvent(
-            { event: "movement_started", payload: { direction: name, speed } },
-            requestId,
-          ),
+  private onPacket(p: DecodedPacket): void {
+    this.opts.onPacket?.(p);
+    if (p.type !== MSG_TYPE.COMMAND) return;
+
+    const cmd = p.cmd;
+    const held = (p.flags & FLAG_HELD) !== 0;
+
+    switch (cmd) {
+      case CMD.HELLO:
+        this.sendStatus(ST.WELCOME, this.state);
+        return;
+
+      case CMD.PING:
+        this.sendStatus(ST.PONG, this.state);
+        return;
+
+      case CMD.BYE:
+        this.releaseWheels("bye");
+        this.setState(ROBOT_STATE.IDLE);
+        return;
+
+      // ---- P0: never refused, never queued ----
+      case CMD.STOP:
+        this.releaseWheels("stop");
+        this.sendAck(cmd);
+        return;
+      case CMD.IDLE:
+        this.cancelAll();
+        this.setState(ROBOT_STATE.IDLE);
+        this.sendAck(cmd);
+        return;
+
+      // ---- held directions ----
+      case CMD.MOVE_FORWARD:
+      case CMD.MOVE_BACKWARD:
+      case CMD.TURN_LEFT:
+      case CMD.TURN_RIGHT:
+      case CMD.ROTATE_LEFT:
+      case CMD.ROTATE_RIGHT:
+        this.handleDrive(cmd, held);
+        return;
+
+      // ---- timed motions ----
+      case CMD.MOVE_STEPS:
+        this.runManeuver(() => this.setState(ROBOT_STATE.MOVING), 400 + p.arg * 100, () =>
+          this.setState(ROBOT_STATE.IDLE),
         );
-        this.movementTimer = setTimeout(() => {
-          this.movementTimer = null;
-          this.pushEvent(makeEvent({ event: "movement_stopped", payload: { reason: "duration_elapsed" } }, requestId));
-          this.setState(this.autonomous ? "autonomous" : "idle");
-        }, Math.max(50, Math.min(duration, 10_000)));
-        return ok();
-      }
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.STOP:
-        this.stopMovement();
-        this.pushEvent(makeEvent({ event: "movement_stopped", payload: { reason: "command" } }, requestId));
-        this.setState(this.autonomous ? "autonomous" : "idle");
-        return ok();
+      case CMD.TURN_DEGREES:
+        if (p.arg < 1 || p.arg > 360) return this.sendError(ERR.BAD_ARG);
+        this.runManeuver(
+          () => this.setState(ROBOT_STATE.MOVING),
+          Math.max(120, (p.arg / 360) * 1400),
+          () => this.setState(ROBOT_STATE.IDLE),
+        );
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.DANCE: {
-        this.stopMovement();
-        this.setState("dancing");
-        this.pushEvent(makeEvent({ event: "dance_started", payload: { style: "wiggle" } }, requestId));
+      case CMD.TURN_AROUND:
+        this.runManeuver(
+          () => this.setState(ROBOT_STATE.MOVING),
+          700,
+          () => this.setState(ROBOT_STATE.IDLE),
+        );
+        this.sendAck(cmd);
+        return;
+
+      // ---- modes ----
+      case CMD.DANCE:
+        this.cancelAll();
+        this.setState(ROBOT_STATE.DANCING);
+        this.sendAck(cmd);
         this.danceTimer = setTimeout(() => {
           this.danceTimer = null;
-          this.pushEvent(makeEvent({ event: "dance_finished", payload: {} }, requestId));
-          this.setState("idle");
-        }, 3000);
-        return ok();
-      }
+          this.setState(ROBOT_STATE.IDLE);
+        }, 4000);
+        return;
 
-      case COMMANDS.EXPLORE: {
-        this.stopMovement();
-        this.setState("exploring");
-        this.pushEvent(makeEvent({ event: "exploration_started", payload: {} }, requestId));
+      case CMD.EXPLORE:
+        this.cancelAll();
+        this.setState(ROBOT_STATE.EXPLORING);
+        this.sendAck(cmd);
         this.exploreTimer = setTimeout(() => {
           this.exploreTimer = null;
-          this.pushEvent(makeEvent({ event: "exploration_finished", payload: {} }, requestId));
-          this.setState("idle");
-        }, 4000);
-        return ok();
-      }
+          this.setState(ROBOT_STATE.IDLE);
+        }, 8000);
+        return;
 
-      case COMMANDS.IDLE:
-        this.stopMovement();
-        this.setState("idle");
-        return ok();
+      case CMD.AUTONOMOUS_ON:
+        // The real robot drives itself when autonomous is on, and that shows
+        // up as the EXPLORING state the app already understands.
+        this.setState(ROBOT_STATE.EXPLORING);
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.SET_EXPRESSION: {
-        const expression = payload.expression as ExpressionName;
-        if (!EXPRESSIONS.includes(expression)) {
-          return fail(ERROR_CODES.INVALID_PAYLOAD, `unknown expression '${String(expression)}'`);
-        }
-        const previous = this.expression;
-        this.expression = expression;
-        this.pushEvent(
-          makeEvent(
-            { event: "expression_changed", payload: { expression, previous } },
-            requestId,
-          ),
-        );
-        return ok();
-      }
+      case CMD.AUTONOMOUS_OFF:
+        this.releaseWheels("autonomous off");
+        this.setState(ROBOT_STATE.IDLE);
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.SPEAK: {
-        const text = String(payload.text ?? "");
-        this.pushEvent(makeEvent({ event: "tts_started", payload: { text } }, requestId));
-        this.expression = "speaking";
-        this.setState("speaking");
-        setTimeout(() => {
-          this.pushEvent(makeEvent({ event: "tts_finished", payload: {} }, requestId));
-          this.setState("idle");
-        }, Math.min(1200, 250 + text.length * 25));
-        return ok();
-      }
+      // ---- expressions ----
+      case CMD.EXPR_HAPPY:
+      case CMD.EXPR_THINKING:
+      case CMD.EXPR_SURPRISED:
+      case CMD.EXPR_CONFUSED:
+      case CMD.EXPR_IDLE:
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.ASK: {
-        const text = String(payload.text ?? "");
-        this.expression = "thinking";
-        this.setState("thinking");
-        this.pushEvent(makeEvent({ event: "stt_started", payload: {} }, requestId));
-        setTimeout(() => {
-          this.pushEvent(makeEvent({ event: "stt_finished", payload: { transcript: text, confidence: 0.94 } }, requestId));
-          this.pushEvent(makeEvent({ event: "gemini_started", payload: { prompt: text } }, requestId));
-        }, 250);
-        setTimeout(() => {
-          this.pushEvent(makeEvent({ event: "gemini_finished", payload: { text: this.replyFor(text) } }, requestId));
-          this.pushEvent(makeEvent({ event: "tts_started", payload: { text: this.replyFor(text) } }, requestId));
-        }, 700);
-        setTimeout(() => {
-          this.pushEvent(makeEvent({ event: "tts_finished", payload: {} }, requestId));
-          this.setState("idle");
-        }, 1600);
-        return ok();
-      }
+      // ---- sensors ----
+      case CMD.READ_SENSOR:
+        this.sendStatus(ST.SENSOR, this.cliff, this.groundCm);
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.LISTEN:
-        this.pushEvent(makeEvent({ event: "listening_started", payload: {} }, requestId));
-        this.setState("listening");
-        setTimeout(() => {
-          const transcript = DEMO_TRANSCRIPTS[this.transcriptIndex % DEMO_TRANSCRIPTS.length]!;
-          this.transcriptIndex += 1;
-          this.pushEvent(
-            makeEvent({ event: "listening_finished", payload: { transcript } }, requestId),
-          );
-          this.setState("idle");
-        }, 900);
-        return ok();
+      // ---- voice, no text frame needed ----
+      case CMD.TALK:
+        this.voiceExchange("Hello! I am WALL-E. What can I do for you?");
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.INTERRUPT:
-        this.stopMovement();
-        this.setState("idle");
-        return ok();
+      case CMD.JOKE:
+        this.voiceExchange("Why did the robot cross the road? To reach the other charging station!");
+        this.sendAck(cmd);
+        return;
 
-      case COMMANDS.SET_AUTONOMOUS: {
-        this.autonomous = Boolean(payload.enabled);
-        this.status.autonomous = this.autonomous;
-        this.status.mode = this.autonomous ? "autonomous" : "manual";
-        this.pushEvent(
-          makeEvent({ event: "autonomous_changed", payload: { enabled: this.autonomous } }, requestId),
-        );
-        this.pushEvent(
-          makeEvent({ event: "mode_changed", payload: { mode: this.status.mode } }, requestId),
-        );
-        if (!this.autonomous && this.state === "autonomous") this.setState("idle");
-        return ok();
-      }
-
-      case COMMANDS.SET_MOTOR_SPEED: {
-        const speed = Number(payload.speed);
-        if (!Number.isFinite(speed) || speed < 0 || speed > 1) {
-          return fail(ERROR_CODES.INVALID_PAYLOAD, "speed must be 0..1");
-        }
-        this.status.motorSpeed = speed;
-        return ok();
-      }
-
-      case COMMANDS.SET_VOLUME: {
-        const volume = Number(payload.volume);
-        if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
-          return fail(ERROR_CODES.INVALID_PAYLOAD, "volume must be 0..1");
-        }
-        this.status.volume = volume;
-        return ok();
-      }
-
-      case COMMANDS.SET_PID:
-        // Accepted for protocol compliance; the mock has no motor tuning loop.
-        return ok();
-
-      case COMMANDS.CAMERA_START:
-        this.pushEvent(
-          makeEvent(
-            {
-              event: "camera_ready",
-              payload: { width: 160, height: 120 },
-            },
-            requestId,
-          ),
-        );
-        return ok();
-
-      case COMMANDS.CAMERA_STOP:
-        return ok();
-
-      case COMMANDS.PING:
-        return this.push(
-          makeResponse(requestId, true, { pong: true, at: Date.now(), status: this.snapshot() }),
-        );
-
-      case COMMANDS.GET_STATUS:
-        return this.push(makeResponse(requestId, true, { status: this.snapshot() }));
+      // ---- ask / speak: the text frame follows ----
+      case CMD.ASK:
+      case CMD.SPEAK:
+        this.pendingTextCmd = cmd;
+        this.sendAck(cmd);
+        return;
 
       default:
-        return fail(ERROR_CODES.UNKNOWN_COMMAND, `unknown command '${String(name)}'`);
+        this.sendError(ERR.UNKNOWN_CMD);
     }
   }
 
-  private replyFor(prompt: string): string {
-    const p = prompt.toLowerCase();
-    const idx = DEMO_REPLIES.findIndex((r) => {
-      if (p.includes("joke")) return r.includes("joke") || r.includes("cross the road");
-      if (p.includes("who")) return r.includes("WALL-E");
-      if (p.includes("camera") || p.includes("see")) return r.includes("camera") || r.includes("floor");
-      return false;
-    });
-    return idx >= 0 ? DEMO_REPLIES[idx]! : DEMO_REPLIES[this.transcriptIndex++ % DEMO_REPLIES.length]!;
+  private onTextFrame(op: number, text: string): void {
+    // Only a reply op from the robot side is expected on this path.
+    if (op !== 0x01 && op !== 0x02) return;
+    const cmd = this.pendingTextCmd;
+    this.pendingTextCmd = null;
+    if (cmd === CMD.ASK) this.voiceExchange(this.replyTo(text));
+    else this.voiceExchange(text);
   }
 
-  private stopMovement(): void {
-    if (this.movementTimer) {
-      clearTimeout(this.movementTimer);
-      this.movementTimer = null;
-      this.pushEvent(makeEvent({ event: "movement_stopped", payload: { reason: "interrupted" } }));
+  private handleDrive(cmd: number, held: boolean): void {
+    // SAFETY FIRST, above every priority rule in the dispatch table.
+    if (wheelsBlockedByVoice(this.state)) {
+      this.sendError(ERR.BUSY);
+      return;
     }
+    if (this.cliffIsBad()) {
+      this.sendError(this.cliff === CLIFF.FAULT ? ERR.SENSOR_FAULT : ERR.CLIFF);
+      return;
+    }
+
+    if (held) {
+      this.heldFromApp = cmd;
+      this.setState(ROBOT_STATE.REMOTE);
+      this.sendAck(cmd);
+      return;
+    }
+
+    // A direction arriving without HELD is treated as a tap: drive briefly,
+    // then stop on its own, which is what the real robot does.
+    this.heldFromApp = null;
+    this.setState(ROBOT_STATE.MOVING);
+    this.sendAck(cmd);
+    this.maneuverTimer = setTimeout(() => {
+      this.maneuverTimer = null;
+      this.setState(ROBOT_STATE.IDLE);
+    }, 500);
+  }
+
+  private runManeuver(start: () => void, ms: number, end: () => void): void {
+    if (wheelsBlockedByVoice(this.state)) return this.sendError(ERR.BUSY);
+    if (this.cliffIsBad()) {
+      return this.sendError(this.cliff === CLIFF.FAULT ? ERR.SENSOR_FAULT : ERR.CLIFF);
+    }
+    this.cancelManeuver();
+    start();
+    this.maneuverTimer = setTimeout(() => {
+      this.maneuverTimer = null;
+      end();
+    }, ms);
+  }
+
+  private voiceExchange(text: string): void {
+    this.cancelTts();
+    this.setState(ROBOT_STATE.THINKING);
+    // The real robot goes to Gemini first, then speaks.
+    this.ttsTimer = setTimeout(() => {
+      this.sendText(0x03, text);
+      this.setState(ROBOT_STATE.SPEAKING);
+      this.ttsTimer = setTimeout(() => {
+        this.ttsTimer = null;
+        this.setState(ROBOT_STATE.IDLE);
+      }, Math.min(2500, 400 + text.length * 25));
+    }, 600);
+  }
+
+  private replyTo(question: string): string {
+    const q = question.toLowerCase();
+    if (q.includes("joke")) return "Why did the robot cross the road? To reach the other charging station!";
+    if (q.includes("who") && q.includes("you")) return "I am WALL-E, a compacting robot with a very curious mind!";
+    if (q.includes("edge") || q.includes("table")) return "My distance sensor watches the floor so I never walk off the edge!";
+    if (q.includes("name")) return "My name is WALL-E!";
+    if (q.includes("hello") || q.includes("hi")) return "Hello there! WALL-E here, ready to roll!";
+    if (q.includes("remote") || q.includes("app")) return "You are talking to me through the app link on port 8080!";
+    return "Beep boop! I heard you. WALL-E is online and ready to explore!";
+  }
+
+  /* ------------------------------------------------------------ *
+   * Safety
+   * ------------------------------------------------------------ */
+
+  private cliffIsBad(): boolean {
+    return cliffIsDangerous(this.cliff);
+  }
+
+  /**
+   * The 700 ms watchdog. While the app owns the wheels, silence from the app
+   * stops the robot. This is the single most important behaviour to simulate
+   * faithfully: it is what stops a robot whose phone screen locked.
+   */
+  private startWatchdog(): void {
+    this.stopWatchdog();
+    this.watchdogTimer = setInterval(() => {
+      if (this.heldFromApp === null) return;
+      if (Date.now() - this.appLastRx > 700) {
+        this.heldFromApp = null;
+        this.sendError(ERR.LINK_TIMEOUT);
+        this.setState(ROBOT_STATE.IDLE);
+      }
+    }, 100);
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private releaseWheels(reason: string): void {
+    void reason;
+    this.heldFromApp = null;
+    this.cancelManeuver();
+  }
+
+  private cancelManeuver(): void {
+    if (this.maneuverTimer) {
+      clearTimeout(this.maneuverTimer);
+      this.maneuverTimer = null;
+    }
+  }
+
+  private cancelTts(): void {
+    if (this.ttsTimer) {
+      clearTimeout(this.ttsTimer);
+      this.ttsTimer = null;
+    }
+  }
+
+  private cancelAll(): void {
+    this.releaseWheels("cancelled");
+    this.cancelTts();
     if (this.danceTimer) {
       clearTimeout(this.danceTimer);
       this.danceTimer = null;
-      this.pushEvent(makeEvent({ event: "dance_finished", payload: {} }));
     }
     if (this.exploreTimer) {
       clearTimeout(this.exploreTimer);
       this.exploreTimer = null;
-      this.pushEvent(makeEvent({ event: "exploration_finished", payload: {} }));
     }
   }
 
-  private setState(state: RobotState): void {
-    if (this.state === state) return;
-    const previous = this.state;
-    this.state = state;
-    this.pushEvent(makeEvent({ event: "state_changed", payload: { state, previous } }));
+  /* ------------------------------------------------------------ *
+   * Outbound
+   * ------------------------------------------------------------ */
+
+  private setState(next: number): void {
+    if (this.state === next) return;
+    this.state = next;
+    this.sendStatus(ST.ROBOT_STATE, this.state);
   }
 
-  private snapshot(): RobotStatus {
-    return {
-      ...this.status,
-      uptimeMs: Date.now() - this.started,
-      state: this.state,
-      expression: this.expression,
-      autonomous: this.autonomous,
-      mode: this.autonomous ? "autonomous" : "manual",
-    };
+  private sendStatus(status: number, value = 0, arg = 0): void {
+    this.send({ type: MSG_TYPE.STATUS, cmd: status, value, arg });
   }
 
-  private pushEvent(event: ReturnType<typeof makeEvent>): void {
-    this.push(event);
-    if (event.event === "state_changed") this.pushStatus();
+  private sendAck(command: number): void {
+    // ACK carries the command that ran, per the integration doc.
+    this.send({ type: MSG_TYPE.STATUS, cmd: ST.ACK, value: command });
   }
 
-  /** Status is pushed after every accepted command so the UI never goes stale. */
-  private pushStatus(): void {
-    this.push(makeEvent({ event: "status", payload: { status: this.snapshot() } }));
+  private sendError(err: number): void {
+    this.send({ type: MSG_TYPE.STATUS, cmd: ST.ERROR, value: err });
   }
 
-  private push(msg: unknown): void {
-    if (this.client && this.client.readyState === 1) {
-      this.client.send(JSON.stringify(msg));
+  private sendText(op: number, text: string): void {
+    const bytes = new TextEncoder().encode(text);
+    const b = Buffer.alloc(8 + bytes.length);
+    b[0] = MAGIC;
+    b[1] = VERSION;
+    b[2] = MSG_TYPE.TEXT;
+    b[3] = op;
+    b[4] = 0;
+    b.writeUInt16LE(bytes.length, 5);
+    b[7] = 0;
+    Buffer.from(bytes).copy(b, 8);
+    this.write(b);
+  }
+
+  private send(f: { type: number; cmd: number; value?: number; arg?: number }): void {
+    this.txSeq = (this.txSeq + 1) & 0xff;
+    const bytes = encodePacket(
+      { type: f.type, cmd: f.cmd, value: f.value ?? 0, arg: f.arg ?? 0, seq: this.txSeq },
+      this.txSeq,
+    );
+    this.write(Buffer.from(bytes));
+  }
+
+  private write(buf: Buffer): void {
+    if (this.client) this.client.write(buf);
+  }
+
+  /** Current state name, for tests and the status endpoint. */
+  get stateName(): string {
+    return robotStateName(this.state);
+  }
+
+  get isDriving(): boolean {
+    return this.heldFromApp !== null;
+  }
+
+  get cliffState(): number {
+    return this.cliff;
+  }
+
+  /**
+   * Simulate driving up to a table edge, for a live demo rehearsal.
+   *
+   * A cliff or a sensor fault is a stop condition in its own right, not just
+   * a reason to refuse the next command, so the real robot reports it as an
+   * ERROR and releases the wheels. This does the same.
+   */
+  setCliff(next: number, groundCm?: number): void {
+    this.cliff = next;
+    if (groundCm !== undefined) this.groundCm = groundCm;
+    this.sendStatus(ST.CLIFF, this.cliff, this.groundCm);
+
+    // Reported every time it is unsafe, not only on the transition. A real
+    // robot that keeps seeing a drop keeps refusing to drive, and re-asserting
+    // the refusal makes the simulator idempotent — setting DROP twice says
+    // DROP twice, so a test that arrives late cannot silently inherit a
+    // previous test's state.
+    if (cliffIsDangerous(next)) {
+      this.releaseWheels("cliff detected");
+      this.setState(ROBOT_STATE.IDLE);
+      this.sendError(next === CLIFF.FAULT ? ERR.SENSOR_FAULT : ERR.CLIFF);
     }
   }
 
   async stop(): Promise<void> {
-    this.stopMovement();
-    this.bonjour?.destroy();
-    this.client?.close();
-    this.wss?.close();
+    this.cancelAll();
+    this.stopWatchdog();
+    if (this.stateTimer) clearInterval(this.stateTimer);
+    this.client?.destroy();
     await new Promise<void>((done) => {
-      if (!this.http) return done();
-      this.http.close(() => done());
+      if (!this.server) return done();
+      this.server.close(() => done());
     });
-    this.http = null;
-    this.wss = null;
+    this.server = null;
   }
-}
-
-// Convenience: emit a single canned command into the mock (used by tests).
-export function demoCommand(command: CommandEnvelope["command"], payload: unknown) {
-  return makeCommand({ command, payload } as never, "demo-test");
-}
-
-/** Best-effort requestId recovery from a frame that failed validation. */
-function extractRequestId(text: string): string | undefined {
-  try {
-    const raw: unknown = JSON.parse(text);
-    if (typeof raw === "object" && raw !== null) {
-      const id = (raw as { requestId?: unknown }).requestId;
-      if (typeof id === "string" && id.length > 0) return id;
-    }
-  } catch {
-    /* unparseable: no id to recover */
-  }
-  return undefined;
 }

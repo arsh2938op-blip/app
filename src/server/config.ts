@@ -1,33 +1,33 @@
 /**
  * Companion-server configuration.
  *
- * Secrets (Gemini key) live ONLY here / in the process environment.
- * They are never bundled into the browser build and never sent to the ESP32.
+ * The robot needs no secrets: it speaks a fixed binary protocol with no
+ * handshake, exactly like the radio remote. The only optional credential is
+ * a bearer token, used only if a future firmware build requires one.
+ *
+ * There is no API key anywhere. The ESP32-S3 holds its own Gemini key and
+ * does its own STT-to-text work off the typed `ask`; the app never sees it
+ * and never needs one.
  */
 
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { DEFAULT_ROBOT_PORT } from "../shared/walleProtocol.js";
 
 export interface AppConfig {
   port: number;
   host: string;
   /** Token the browser must present on the app WebSocket. */
   appToken: string;
-  /** Optional shared secret the ESP32 requires in its handshake header. */
+  /** Optional bearer secret the robot would require. */
   robotToken?: string;
-  /** Gemini API key, held server-side only. */
-  geminiApiKey?: string;
-  geminiModel: string;
-  /** Fall back to a requestId timeout when the robot never replies. */
+  defaultRobotHost: string | null;
+  defaultRobotPort: number;
   requestTimeoutMs: number;
   reconnect: { enabled: boolean; minDelayMs: number; maxDelayMs: number };
   rateLimit: { windowMs: number; maxCommands: number };
-  discovery: { enabled: boolean; timeoutMs: number };
-  lastKnownHost: string | null;
   demoMode: boolean;
-  defaultMotorSpeed: number;
-  defaultVolume: number;
 }
 
 /** Minimal .env loader — avoids a dependency for ~30 lines. */
@@ -71,18 +71,15 @@ function str(name: string): string | undefined {
 export function loadConfig(rootDir = process.cwd()): AppConfig {
   loadDotEnv(resolve(rootDir, ".env"));
 
-  const explicitToken = str("WALLE_APP_TOKEN");
-  const port = num("PORT", 8787);
-
   return {
-    port,
+    port: num("PORT", 8787),
     host: str("HOST") ?? "0.0.0.0",
-    // A random per-boot token still requires a page reload to recover, and the
-    // token is embedded in index.html by the dev server, not hard-coded.
-    appToken: explicitToken ?? `walle-app-${randomBytes(16).toString("hex")}`,
+    // A random per-boot token; the browser fetches it from /api/session on
+    // its own origin, so nothing secret is ever baked into the bundle.
+    appToken: str("WALLE_APP_TOKEN") ?? `walle-app-${randomBytes(16).toString("hex")}`,
     robotToken: str("WALLE_ROBOT_TOKEN"),
-    geminiApiKey: str("GEMINI_API_KEY"),
-    geminiModel: str("GEMINI_MODEL") ?? "gemini-2.0-flash",
+    defaultRobotHost: str("WALLE_ROBOT_HOST") ?? null,
+    defaultRobotPort: num("WALLE_ROBOT_PORT", DEFAULT_ROBOT_PORT),
     requestTimeoutMs: num("WALLE_REQUEST_TIMEOUT_MS", 5000),
     reconnect: {
       enabled: bool("WALLE_RECONNECT", true),
@@ -91,15 +88,8 @@ export function loadConfig(rootDir = process.cwd()): AppConfig {
     },
     rateLimit: {
       windowMs: num("WALLE_RATE_WINDOW_MS", 1000),
-      maxCommands: num("WALLE_RATE_MAX", 25),
+      maxCommands: num("WALLE_RATE_MAX", 60),
     },
-    discovery: {
-      enabled: bool("WALLE_DISCOVERY", true),
-      timeoutMs: num("WALLE_DISCOVERY_TIMEOUT_MS", 4000),
-    },
-    lastKnownHost: str("WALLE_ROBOT_HOST") ?? null,
     demoMode: bool("WALLE_DEMO", false),
-    defaultMotorSpeed: num("WALLE_MOTOR_SPEED", 0.6),
-    defaultVolume: num("WALLE_VOLUME", 0.7),
   };
 }

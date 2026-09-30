@@ -1,442 +1,334 @@
-# WALL-E Robot API v1
+# WALL-E Robot API — as implemented by the ESP32-S3 firmware
 
-The communication contract between the **WALL-E App** and the **ESP32-C3 firmware**.
+This app is built against the **real** firmware protocol, not an invented one.
+The authoritative sources are in the firmware repository:
 
-The two projects are developed in separate repositories and meet *only* through
-this document. Nothing in the app repo may be assumed about firmware internals,
-and nothing in the firmware repo may be assumed about the UI.
+| Source | Path |
+|---|---|
+| Protocol constants | `WALL-E/shared/walle_protocol.h` |
+| Integration spec | `WALL-E/robot_s3/docs/APP_INTEGRATION.md` |
+| App link (TCP) | `WALL-E/robot_s3/src/app_link.{h,cpp}` |
+| Command dispatch | `WALL-E/robot_s3/src/command_dispatch.{h,cpp}` |
+| Timing/safety config | `WALL-E/robot_s3/include/config.h` |
 
-- Contract version: **1**
-- Transport: **WebSocket**, JSON text frames
-- Default endpoint: `ws://<robot-ip>:8080/`
-- Discovery: **mDNS / DNS-SD**, service type `_walle._tcp.local`
-- Reference implementation: [`src/mock/mockRobot.ts`](../src/mock/mockRobot.ts)
+The TypeScript mirror of all of this is
+[`src/shared/walleProtocol.ts`](../src/shared/walleProtocol.ts), and
+`tests/walleProtocol.test.ts` asserts every constant against the values in the
+firmware header. If the firmware changes a command id, the tests fail.
+
+**The app is a second controller.** It speaks the same 10-byte packets as the
+ESP32-WROOM radio remote, over TCP instead of ESP-NOW. The robot funnels both
+into one dispatcher, so the app and the remote cannot disagree about what a
+command means.
 
 ---
 
-## 1. Connecting
+## 1. Transport
 
-The firmware runs a WebSocket server on port **8080** and accepts one or more
-app connections. The app is the client.
-
-```
-WALL-E App (browser)
-      │  WebSocket
-      ▼
-Companion server (Node)  ── mDNS browse ──▶  ESP32-C3
-      │  WebSocket  ws://<ip>:8080/
-      ▼
-   ESP32-C3 firmware
-```
-
-The companion server exists because browsers cannot do mDNS and because the
-Gemini API key must never reach the browser or the robot.
-
-### 1.1 Handshake
-
-On a successful WebSocket upgrade the firmware **must** send:
-
-```json
-{ "type": "event", "v": 1, "event": "robot_ready",
-  "payload": { "status": { "…": "RobotStatus" } } }
-```
-
-`robot_booted` may be sent immediately before it. A client that receives
-neither within ~5 s should treat the connection as unusable.
-
-### 1.2 Optional shared secret
-
-If the firmware is configured with a token, it must reject the upgrade unless
-the client sends:
-
-```
-Authorization: Bearer <WALLE_ROBOT_TOKEN>
-```
-
-The app reads `WALLE_ROBOT_TOKEN` from its own environment and sends it as a
-header. **Never** in the query string — URLs end up in logs.
-
-### 1.3 Connection states
-
-| State | Meaning |
+| | |
 |---|---|
-| `disconnected` | No socket. Initial state, and after a clean close. |
-| `connecting` | First attempt at the current target. |
-| `connected` | Socket open. Commands may be sent. |
-| `reconnecting` | A retry is scheduled after a drop. |
-| `error` | The last attempt failed. |
+| Transport | **raw TCP** — not HTTP, not WebSocket, not JSON |
+| Port | **8080** (`APP_TCP_PORT`) |
+| Addressing | The robot's IP, printed on its serial log at boot |
+| Handshake | None |
+| Secret | None |
 
-The app shows **“WALL-E offline”** on `disconnected` / `error`, and retries with
-exponential backoff (0.5 s → 10 s) when auto-reconnect is enabled.
+A browser cannot open a raw TCP socket, which is why the companion server
+exists. It does the framing; the UI sends ordinary JSON.
+
+### Why there is no discovery
+
+The firmware contains **no mDNS** — I checked every source file. WALL-E does
+not advertise itself, so `wall-e.local` will not resolve and there is nothing
+to browse for. The app therefore:
+
+1. asks for the IP in the Connect tab, and
+2. remembers it, so a demo needs the IP typed once.
+
+`GET /api/scan` exists but only echoes the configured host. It is a
+placeholder, not a working scanner, and the UI says so.
 
 ---
 
-## 2. Discovery
+## 2. The 700 ms watchdog — the thing that will bite you
 
-The firmware advertises itself over mDNS so the user never types an IP.
+While the app is **driving**, it must send **something at least every 700 ms**
+(`APP_TIMEOUT_MS`) or the robot stops and releases the wheels.
 
-| Field | Value |
+This is deliberate. A phone whose screen locks, or an app whose tab is
+backgrounded, must never leave the robot driving.
+
+The app satisfies it three ways:
+
+| Situation | What the app sends |
 |---|---|
-| Service type | `_walle._tcp.local.` |
-| Service name | `WALL-E` |
-| Port | `8080` |
+| Direction held | Re-sends the held command every **250 ms** with `FLAG_HELD` |
+| Connected, not driving | `PING` every 300 ms |
+| Driving, then finger lifts | `STOP` immediately, then disarms the keepalive |
 
-### TXT record
+The 250 ms cadence is what the radio remote uses; it leaves comfortable margin
+for a congested Wi-Fi network.
 
-| Key | Example | Meaning |
+The app also holds a **screen wake lock** while visible, because Android will
+lock an idle screen after a few seconds — and a locked screen means a silent
+app, which means a stopped robot mid-manoeuvre.
+
+When the robot stops you for a timeout it sends `ERROR` / `LINK_TIMEOUT`. The
+app treats this as a *notice*, not a disconnect: the link is still up, so it
+just needs the keepalive running again.
+
+---
+
+## 3. Frames
+
+### 3.1 Fixed packet — 10 bytes, little endian
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | magic | `0xA5` always. Used to resynchronise. |
+| 1 | 1 | version | `0x01` |
+| 2 | 1 | type | `0x01` COMMAND, `0x02` STATUS, `0x03` TEXT |
+| 3 | 1 | cmd | command or status id |
+| 4 | 1 | value | small argument: state, error, expression |
+| 5 | 1 | seq | rolling counter 0–255, wraps |
+| 6 | 1 | flags | bit 0 = `WALLE_FLAG_HELD` (0x01) |
+| 7 | 1 | reserved | 0 |
+| 8 | 2 | arg | `uint16` LE — step count, degrees, millivolts |
+
+Encoded with `DataView`, never a packed struct: C struct padding rules differ
+between platforms and the firmware asserts the type is exactly 10 bytes.
+
+### 3.2 Text frame — 8-byte header + UTF-8 payload
+
+| Offset | Size | Field |
 |---|---|---|
-| `name` | `WALL-E` | Display name shown in the app |
-| `fw` | `1.0.0` | Firmware version |
-| `model` | `esp32-c3` | Hardware id |
+| 0 | 1 | magic `0xA5` |
+| 1 | 1 | version `0x01` |
+| 2 | 1 | type `0x03` TEXT |
+| 3 | 1 | op — `0x01` ask, `0x02` speak, `0x03` reply |
+| 4 | 1 | flags |
+| 5 | 2 | len `uint16` LE, 1–240 |
+| 6–7 | | padding to 8 |
+| 8… | len | UTF-8, no terminator, no escaping |
 
-The firmware may also register `wall-e.local` as an mDNS hostname, so
-`ws://wall-e.local:8080/` works as a manual fallback.
+`ASK` and `SPEAK` are announced as a fixed packet, then the words follow
+**immediately** in a text frame.
 
-**Manual connection must always work.** mDNS is frequently blocked on Windows
-and some enterprise Wi-Fi; the app therefore keeps a manual IP field and stores
-the last successful address.
+Text is truncated at **240 bytes on a character boundary**, not a byte
+boundary — slicing encoded bytes at 240 would cut a 3-byte character in half
+and hand the robot invalid UTF-8.
 
----
+### 3.3 Stream framing — a bug the spec walks into
 
-## 3. Message format
+TCP has no message boundaries. The reference pseudocode in
+`APP_INTEGRATION.md` decides a frame is fixed-size first, and only looks for a
+text header at offset 8. That cannot work: a text frame whose total length
+happens to be 10 bytes (an 8-byte header plus 2 bytes of text) is
+indistinguishable from a fixed packet by length alone, and gets misparsed.
 
-Every frame in both directions is a single JSON object. Three envelope types:
+The app instead reads the **type byte at offset 2**, which is unambiguous, as
+soon as three bytes have arrived. It also drops a frame whose version byte
+does not follow the magic, so a partial frame from a previous connection is
+never decoded as garbage.
 
-### 3.1 Command — app → robot
-
-```json
-{
-  "type": "command",
-  "v": 1,
-  "command": "move_forward",
-  "requestId": "req-m1a2b3-1-9xk2",
-  "payload": { "speed": 0.6, "duration": 600 },
-  "timestamp": 1730000000000
-}
-```
-
-### 3.2 Response — robot → app
-
-Sent exactly once per command, carrying the same `requestId`.
-
-```json
-{
-  "type": "response",
-  "v": 1,
-  "requestId": "req-m1a2b3-1-9xk2",
-  "success": true,
-  "data": { "…": "optional command-specific result" },
-  "timestamp": 1730000000123
-}
-```
-
-On failure:
-
-```json
-{
-  "type": "response",
-  "v": 1,
-  "requestId": "req-m1a2b3-1-9xk2",
-  "success": false,
-  "error": { "code": "E_NOT_SUPPORTED", "message": "camera not configured" },
-  "timestamp": 1730000000123
-}
-```
-
-### 3.3 Event — robot → app
-
-Unsolicited, or correlated to the action that caused it.
-
-```json
-{
-  "type": "event",
-  "v": 1,
-  "event": "movement_started",
-  "requestId": "req-m1a2b3-1-9xk2",
-  "payload": { "direction": "move_forward", "speed": 0.6 },
-  "timestamp": 1730000000005
-}
-```
-
-### 3.4 Rules
-
-1. `v` is required on every frame. The app accepts `v <= 1` and rejects newer
-   versions rather than guessing.
-2. `requestId` is required on `command` and `response`. A `command` without one
-   is rejected with `E_INVALID_PAYLOAD`.
-3. Frames above 512 KB are dropped (`E_BAD_JSON`, “message too large”).
-4. The app **ignores** inbound `command` frames. A robot cannot instruct the app.
-5. `timestamp` is milliseconds since the Unix epoch and is advisory only.
+`tests/walleProtocol.test.ts` covers 10-byte text frames, back-to-back text
+frames, and stray-byte recovery.
 
 ---
 
 ## 4. Commands
 
-`payload` is always an object, possibly empty. Out-of-range values are rejected
-by the app before transmission.
+`payload` — the fixed packet has one `arg` field; there is no JSON payload.
 
-### Movement
+### Locomotion (held)
 
-| Command | Payload | Notes |
+| Id | Name | Behaviour |
 |---|---|---|
-| `move_forward` | `{ duration?, speed? }` | `duration` ms, `speed` 0–1 |
-| `move_backward` | `{ duration?, speed? }` | |
-| `turn_left` | `{ duration?, speed? }` | differential turn |
-| `turn_right` | `{ duration?, speed? }` | |
-| `rotate_left` | `{ duration?, speed? }` | in-place |
-| `rotate_right` | `{ duration?, speed? }` | in-place |
-| `stop` | `{}` | **highest priority.** Ends any movement immediately |
+| `0x01` | `move_forward` | drives while held; re-send or it stops |
+| `0x02` | `move_backward` | as above |
+| `0x03` | `turn_left` | arc left, held |
+| `0x04` | `turn_right` | arc right, held |
+| `0x05` | `rotate_left` | pivot on the spot, held |
+| `0x06` | `rotate_right` | pivot on the spot, held |
+| `0x07` | `stop` | **highest priority from any source.** Never `HELD`. |
 
-Omitting `duration` means “run until an explicit `stop`”. The app always sends
-`stop` on pointer release in manual mode, so the firmware must treat `stop` as
-safe to receive at any time, including while already stopped.
+### Timed motions (finish on their own)
 
-### Behaviour
-
-| Command | Payload | Notes |
+| Id | Name | `arg` |
 |---|---|---|
-| `dance` | `{ style? }` | Local routine. Firmware picks a sensible duration. |
-| `explore` | `{}` | Local autonomous excursion. |
-| `idle` | `{}` | Cancel dance/explore, return to rest. |
+| `0x17` | `move_steps` | 1–50 steps (`STEP_DISTANCE_CM` = 10 cm) |
+| `0x18` | `turn_around` | — (180°) |
+| `0x1c` | `turn_degrees` | 1–360° |
 
-### Expression
+No keepalive, and **no `stop` afterwards** — sending one is harmless but
+pointless. Still subject to the cliff sensor.
 
-| Command | Payload |
+### Modes
+
+| Id | Name |
 |---|---|
-| `set_expression` | `{ "expression": "happy" }` |
+| `0x10` | `dance` |
+| `0x11` | `explore` |
+| `0x12` | `idle` |
+| `0x13` | `autonomous_on` |
+| `0x14` | `autonomous_off` |
 
-Allowed: `neutral`, `happy`, `sad`, `confused`, `surprised`, `thinking`,
-`listening`, `speaking`, `idle`.
+### Voice
 
-### Voice / AI
-
-| Command | Payload | Notes |
+| Id | Name | Notes |
 |---|---|---|
-| `speak` | `{ text }` | ≤ 500 chars, TTS on the robot |
-| `ask` | `{ text }` | Full STT → Gemini → TTS chain |
-| `listen` | `{ duration? }` | Open the mic, emit the transcript |
-| `set_volume` | `{ volume }` | 0–1 |
-| `interrupt` | `{}` | Abort speech/listening immediately |
+| `0x15` | `talk` | robot decides what to say, then says it |
+| `0x16` | `joke` | robot decides the joke |
+| `0x1a` | `ask` | **then** a text frame with the question |
+| `0x1b` | `speak` | **then** a text frame, said verbatim |
 
-`ask` is the only AI command. The app does **not** run Gemini locally: it sends
-`ask`, the firmware owns the pipeline, and the app renders the resulting
-`gemini_finished` event. The ESP32 must therefore work standalone.
+**The robot has no microphone.** Speech-to-text is not on the robot and not in
+this app. You type the question; the robot answers in text and speaks it out
+loud. The answer arrives as a `TEXT` frame with `op = 0x03`.
 
-### Camera
+### Expressions
 
-| Command | Payload | Notes |
-|---|---|---|
-| `camera_start` | `{}` | Begins the camera transport the firmware supports |
-| `camera_stop` | `{}` | Stops it |
-
-See §7.
-
-### Configuration
-
-| Command | Payload |
+| Id | Name |
 |---|---|
-| `set_autonomous` | `{ "enabled": true }` |
-| `set_motor_speed` | `{ "speed": 0.6 }` |
-| `set_pid` | `{ "kp": 8.0, "kd": 0.5, "kp_distance": 2.0 }` |
-| `ping` | `{}` |
-| `get_status` | `{}` |
+| `0x20` | `expression_happy` |
+| `0x21` | `expression_thinking` |
+| `0x22` | `expression_surprised` |
+| `0x23` | `expression_confused` |
+| `0x24` | `expression_idle` |
 
-`set_autonomous` is the only switch that hands control back to the robot. When
-autonomous is `true` the app shows a hint and stops appending `stop` on
-release, because WALL-E owns its own movement.
+Five expressions, not nine. The firmware defines five.
+
+### Sensors and housekeeping
+
+| Id | Name |
+|---|---|
+| `0x19` | `read_sensor` |
+| `0x30` | `hello` |
+| `0x31` | `ping` |
+| `0x32` | `bye` |
 
 ---
 
-## 5. Events
+## 5. Status
 
-| Event | Payload |
+| Id | Name | Carries |
+|---|---|---|
+| `0x80` | `WELCOME` | `value` = robot state, on connect and after `hello` |
+| `0x81` | `ACK` | `value` = the command that ran |
+| `0x82` | `ERROR` | `value` = error code |
+| `0x83` | `ROBOT_STATE` | `value` = robot state |
+| `0x84` | `REMOTE_STATE` | `value` = radio remote state 0–3 |
+| `0x85` | `BATTERY` | `arg` = millivolts, 0 = unknown — **never sent today** |
+| `0x86` | `PONG` | `value` = robot state |
+| `0x87` | `SENSOR` | `value` = cliff state, `arg` = ground distance in cm |
+| `0x88` | `CLIFF` | `value` = cliff state, on transition |
+
+### Robot states
+
+| # | Name | |
+|---|---|---|
+| 0 | `boot` | starting up |
+| 1 | `idle` | awake |
+| 2 | `thinking` | **wheels blocked** |
+| 3 | `speaking` | **wheels blocked** |
+| 4 | `exploring` | driving itself |
+| 5 | `observing` | paused, looking around |
+| 6 | `moving` | mid-manoeuvre |
+| 7 | `dancing` | |
+| 8 | `remote` | a controller owns the wheels |
+| 9 | `offline` | no Wi-Fi, AI paused |
+
+The robot re-sends `ROBOT_STATE` about once a second as a keepalive floor. The
+app's activity feed **collapses consecutive duplicates**, because treating
+each one as a screen update would make the log unreadable.
+
+### Cliff states
+
+| # | Name | |
+|---|---|---|
+| 0 | `unknown` | not configured, or no reading yet |
+| 1 | `ground` | safe |
+| 2 | `warn` | near the edge, driving slowly |
+| 3 | `drop` | **no floor — stopped** |
+| 4 | `fault` | **sensor not responding — stopped** |
+
+`arg` is the vertical distance to the floor in cm. This is the difference
+between "the robot is stuck" and "the robot correctly refused to walk off the
+table", so the app shows it prominently.
+
+### Errors
+
+| # | Name | What the app shows |
+|---|---|---|
+| 1 | `BAD_PACKET` | Bad packet from the robot |
+| 2 | `UNKNOWN_CMD` | WALL-E did not recognise that command |
+| 3 | `NOT_CONFIGURED` | That feature is not wired up on this robot |
+| 4 | `BUSY` | The handheld remote has control |
+| 5 | `CLIFF` | WALL-E stopped at the edge — pick it up or move it back |
+| 6 | `SENSOR_FAULT` | WALL-E's distance sensor is not responding |
+| 7 | `BAD_ARG` | That value was out of range |
+| 8 | `LINK_TIMEOUT` | WALL-E stopped driving because the app went quiet |
+
+The wording is taken verbatim from the integration doc's "what the app should
+show" column, so the UI never invents its own phrasing for a safety refusal.
+`CLIFF` and `SENSOR_FAULT` are **not retried** — they are stop conditions.
+
+---
+
+## 6. Priority and safety
+
+Above the dispatcher's priority table, **safety wins**: every motion command
+is offered to the safety guard first. A cliff, a dead sensor, or a
+conversation in progress refuses the command, whatever asked for it.
+
+- `STOP`, `BYE` and `IDLE` from any source always run.
+- Exactly one controller owns the wheels at a time.
+- While `thinking` or `speaking`, movement is refused with `BUSY` — a robot
+  that rolls while talking cannot be heard and cannot be stopped.
+
+The app surfaces all of this rather than fighting it. The joystick greys out
+and a notice appears explaining why.
+
+---
+
+## 7. What the app cannot do, and why
+
+| Missing | Reason |
 |---|---|
-| `robot_booted` | `{ firmwareVersion }` |
-| `robot_ready` | `{ status }` |
-| `robot_disconnected` | `{ reason? }` |
-| `state_changed` | `{ state, previous? }` |
-| `movement_started` | `{ direction, speed? }` |
-| `movement_stopped` | `{ reason? }` |
-| `expression_changed` | `{ expression, previous? }` |
-| `mode_changed` | `{ mode }` |
-| `autonomous_changed` | `{ enabled }` |
-| `listening_started` | `{}` |
-| `listening_finished` | `{ transcript? }` |
-| `stt_started` | `{}` |
-| `stt_finished` | `{ transcript, confidence? }` |
-| `gemini_started` | `{ prompt }` |
-| `gemini_finished` | `{ text }` |
-| `tts_started` | `{ text }` |
-| `tts_finished` | `{}` |
-| `dance_started` | `{ style? }` |
-| `dance_finished` | `{}` |
-| `exploration_started` | `{}` |
-| `exploration_finished` | `{}` |
-| `camera_frame` | `{ mime, data }` |
-| `camera_ready` | `{ streamUrl?, width?, height? }` |
-| `camera_error` | `{ message }` |
-| `status` | `{ status }` |
-| `log` | `{ level, message }` |
-| `error` | `{ code, message, detail? }` |
+| Microphone / STT | The robot has no mic, and the app has no speech provider. Type instead. |
+| Camera view | The camera is compiled out on the ESP32-S3. |
+| Battery gauge | `BATTERY` exists in the protocol but no sensor feeds it. The row is hidden until a real reading arrives. |
+| Audio playback | The robot streams TTS to its own amplifier; it sends no audio back. |
+| Discovery | No mDNS in the firmware. |
+| Distances | No wheel encoders. "4 steps" is a timed estimate from `STEP_DISTANCE_CM`, not a measurement. |
 
-The firmware **should** emit `status` after any change to `state`, `expression`,
-`mode`, `autonomous`, `motorSpeed` or `volume`, so the app's status panel is
-never stale.
+---
 
-### RobotStatus
+## 8. Verifying the app against real hardware
 
-```json
-{
-  "name": "WALL-E",
-  "firmwareVersion": "1.0.0",
-  "ip": "192.168.1.42",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "wifiRssi": -52,
-  "uptimeMs": 128400,
-  "state": "idle",
-  "expression": "happy",
-  "mode": "manual",
-  "autonomous": false,
-  "motorSpeed": 0.6,
-  "volume": 0.7,
-  "freeHeap": 142336,
-  "cameraAvailable": true
-}
+1. Power the robot and note the IP from its serial log.
+2. Start the companion server: `npm run dev:server`.
+3. Start the UI: `npm run dev:client`.
+4. Connect tab → enter the IP → **Connect**.
+
+Or prove the framing without the app at all:
+
+```python
+import socket, struct, time
+HOST, PORT = "192.168.1.42", 8080
+
+def packet(cmd, arg=0, value=0, flags=0, seq=0):
+    return struct.pack("<BBBBBBBB H", 0xA5, 0x01, 0x01, cmd, value, seq, flags, 0, arg)
+
+s = socket.create_connection((HOST, PORT), timeout=5)
+s.sendall(packet(0x30))     # HELLO
+time.sleep(0.3)
+s.sendall(packet(0x19))     # READ_SENSOR
+time.sleep(0.5)
+print(s.recv(512).hex(" ")) # expect a5 01 02 80 ... then a5 01 02 87 ...
 ```
 
-`state` ∈ `booting`, `idle`, `moving`, `dancing`, `exploring`, `listening`,
-`thinking`, `speaking`, `autonomous`, `charging`, `error`.
-`mode` ∈ `manual`, `autonomous`, `demo`.
-
-**`battery` is optional and must be omitted unless a real sensor exists.** The
-app hides the row entirely when it is absent, rather than showing a fake 100 %.
-
----
-
-## 6. Error codes
-
-| Code | Meaning |
-|---|---|
-| `E_BAD_JSON` | Frame is not parseable JSON, or too large |
-| `E_UNSUPPORTED_VERSION` | Missing or newer-than-supported `v` |
-| `E_UNKNOWN_TYPE` | Unrecognised `type` or `event` |
-| `E_UNKNOWN_COMMAND` | Command not implemented |
-| `E_INVALID_PAYLOAD` | Payload missing or out of range |
-| `E_UNAUTHORIZED` | Bad or missing shared secret |
-| `E_RATE_LIMITED` | Too many commands |
-| `E_BUSY` | Robot cannot accept the command right now |
-| `E_NOT_SUPPORTED` | Feature absent on this hardware build |
-| `E_TIMEOUT` | No response in time |
-| `E_INTERNAL` | Firmware fault |
-
----
-
-## 7. Camera transport
-
-The camera interface is **firmware-decided**. The app renders what it receives
-and shows a placeholder otherwise — it does not assume a video codec the
-ESP32-C3 has not confirmed.
-
-**Option A — stream URL (preferred if the firmware can sustain it).**
-
-`camera_start` → `camera_ready` with `streamUrl`:
-
-```json
-{ "type": "event", "v": 1, "event": "camera_ready",
-  "payload": { "streamUrl": "http://192.168.1.42:8081/stream", "width": 160, "height": 120 } }
-```
-
-The app hands the URL to a native `<video>` element, which handles MJPEG and
-H.264 without a custom demuxer.
-
-**Option B — discrete JPEG frames (recommended for the C3).**
-
-Emit `camera_frame` events at a modest rate, base64-encoded:
-
-```json
-{ "type": "event", "v": 1, "event": "camera_frame",
-  "payload": { "mime": "image/jpeg", "data": "<base64>", "width": 160, "height": 120 } }
-```
-
-Keep the resolution low (QQVGA 160×120 is a reasonable starting point for an
-ESP32-C3) and cap the frame rate — 5–10 fps is plenty for a demo and keeps the
-WebSocket and heap manageable. The app renders each frame as an `<img>`.
-
-**Option C — no camera.** Reply `camera_start` with
-`success: false, error: { code: "E_NOT_SUPPORTED" }`. The app shows
-“Camera is not available on this build”.
-
-**Recommendation:** implement Option B first. Streaming video from an ESP32-C3
-is expensive in RAM and bandwidth and is the most likely part of this project
-to need tuning; discrete frames prove the whole path with far less risk.
-
----
-
-## 8. Security
-
-- **The Gemini API key never reaches the ESP32 or the browser bundle.** The
-  companion server holds it and, for app-initiated `ask`, calls the API itself.
-  The robot's own `ask` path uses a key configured in firmware only.
-- **The app never executes arbitrary network input.** Every inbound frame is
-  parsed and validated (`src/shared/validate.ts`); every outbound command is
-  checked against an allowlist (`src/shared/validateCommand.ts`) before it is
-  forwarded.
-- **The robot cannot drive the app.** Inbound `command` frames are discarded.
-- **Rate limiting** — the server caps commands per second per client.
-- **Shared secret optional.** `WALLE_ROBOT_TOKEN` adds a bearer check on the
-  WebSocket upgrade. On an open Innovation Day network it can be skipped, but
-  any deployment on shared Wi-Fi should use it.
-- **No destructive commands exist in v1.** `stop` is the only safety-critical
-  one and is always transmitted without awaiting a response.
-
----
-
-## 9. Versioning
-
-- `v` is a single integer. The app accepts `v <= 1`.
-- Additive changes (new optional payload fields, new events) keep `v` at 1.
-- Breaking changes bump `v`. The app then reports
-  `E_UNSUPPORTED_VERSION` instead of misinterpreting frames.
-- Unknown fields inside a payload **must be ignored** by both sides.
-- Unknown commands and events **must** be rejected/ignored, never crash the peer.
-
----
-
-## 10. Firmware implementation checklist
-
-- [ ] WebSocket server on port 8080
-- [ ] Send `robot_ready` with a full `RobotStatus` on connect
-- [ ] mDNS advertise `_walle._tcp.local.` with `name`, `fw`, `model` TXT keys
-- [ ] Accept `Authorization: Bearer …` when a token is configured
-- [ ] Parse each frame, reply with exactly one `response` per `command`
-- [ ] Honour `requestId` on every response
-- [ ] Implement all 7 movement commands, with `stop` always safe
-- [ ] Implement `dance`, `explore`, `idle`
-- [ ] Implement `set_expression` for all 9 expressions
-- [ ] Implement `speak`, `ask`, `listen`, `set_volume`, `interrupt`
-- [ ] Implement `set_autonomous`, `set_motor_speed`, `set_pid`
-- [ ] Implement `ping` and `get_status`
-- [ ] Emit `state_changed`, `movement_started`, `movement_stopped`
-- [ ] Emit the STT → Gemini → TTS event chain for `ask`
-- [ ] Emit `dance_started` / `dance_finished`, `exploration_started` / `_finished`
-- [ ] Emit `status` after any status change
-- [ ] Implement the camera path (Option B recommended) or fail with `E_NOT_SUPPORTED`
-- [ ] Omit `battery` unless a real sensor exists
-- [ ] Run standalone: the robot must work with no app connected
-
----
-
-## 11. Conformance testing
-
-The mock in `src/mock/mockRobot.ts` implements this contract and is exercised
-by `tests/robotLink.test.ts`. It is the fastest way for the firmware author to
-validate a build:
-
-1. Start the mock: `npm run mock` (add `MOCK_ADVERTISE=1` for mDNS).
-2. Start the app: `npm run dev`, enable Demo Mode.
-3. Point the real app at the firmware: Connect → enter `<ip>` → `8080`.
-
-For a conformance suite that runs against either implementation, the firmware
-side should be able to satisfy the same test file by exposing an identical
-WebSocket surface. Every test in `tests/robotLink.test.ts` uses only the wire
-protocol — no mock-specific hooks except the optional `onCommand` observer.
+**Before driving anything**, set the robot on the floor with clear space, and
+confirm the cliff sensor reads `ground` — the status panel shows the ground
+distance in centimetres. A `drop` or `fault` means WALL-E will refuse to move,
+which is the correct behaviour, not a bug.

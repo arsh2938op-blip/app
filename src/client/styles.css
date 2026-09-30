@@ -1,4 +1,5 @@
-/* WALL-E control centre — dark, high-contrast, demo-legible. */
+/* WALL-E control centre.
+   Dark, high-contrast, and laid out for a phone held in one hand. */
 
 :root {
   --bg: #0b0d12;
@@ -13,6 +14,11 @@
   --warn: #e8a33d;
   --err: #e5484d;
   --radius: 12px;
+  /* Safe areas on notched phones. */
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
 }
 
 * {
@@ -34,16 +40,24 @@ body {
   overscroll-behavior: none;
 }
 
-button {
+button,
+input,
+select {
   font: inherit;
   color: inherit;
+}
+
+button {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 10px;
-  padding: 10px 14px;
+  padding: 11px 14px;
   cursor: pointer;
   transition: background 0.12s, transform 0.06s, border-color 0.12s;
   user-select: none;
+  touch-action: manipulation;
+  /* Comfortable target on a phone without looking clumsy. */
+  min-height: 44px;
 }
 button:hover:not(:disabled) {
   background: #262e3d;
@@ -77,24 +91,28 @@ button.on {
 }
 
 input,
-select,
-textarea {
-  font: inherit;
-  color: inherit;
+select {
   background: #0f131b;
   border: 1px solid var(--line);
   border-radius: 10px;
-  padding: 10px 12px;
+  padding: 11px 12px;
   width: 100%;
+  min-height: 44px;
+  /* 16px stops iOS zooming the page on focus. */
+  font-size: 16px;
+}
+input[type="range"] {
+  padding: 0;
+  min-height: 32px;
+  accent-color: var(--accent);
 }
 input:focus,
-select:focus,
-textarea:focus {
+select:focus {
   outline: 2px solid var(--accent-dim);
   outline-offset: 1px;
 }
 
-/* ---------- layout ---------- */
+/* ---------------- layout ---------------- */
 
 .app {
   display: flex;
@@ -102,14 +120,15 @@ textarea:focus {
   min-height: 100%;
   max-width: 1180px;
   margin: 0 auto;
-  padding: 12px;
+  padding: calc(10px + var(--safe-t)) calc(12px + var(--safe-r)) calc(16px + var(--safe-b))
+    calc(12px + var(--safe-l));
   gap: 12px;
 }
 
 .topbar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
   padding: 12px 14px;
   background: var(--panel);
@@ -124,7 +143,7 @@ textarea:focus {
   margin-right: auto;
 }
 .brand h1 {
-  font-size: 20px;
+  font-size: 19px;
   margin: 0;
   letter-spacing: 0.04em;
 }
@@ -136,6 +155,7 @@ textarea:focus {
   display: grid;
   place-items: center;
   font-size: 19px;
+  flex: none;
 }
 
 .conn {
@@ -143,6 +163,7 @@ textarea:focus {
   align-items: center;
   gap: 8px;
   font-weight: 600;
+  font-size: 14px;
 }
 .dot {
   width: 10px;
@@ -169,27 +190,58 @@ textarea:focus {
   }
 }
 
+.state-pill {
+  text-transform: capitalize;
+}
+.state-pill.idle,
+.state-pill.remote {
+  color: var(--ok);
+  border-color: #1f5c42;
+}
+.state-pill.dancing,
+.state-pill.moving,
+.state-pill.speaking {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.state-pill.offline,
+.state-pill.boot {
+  color: var(--muted);
+}
+.state-pill.thinking {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+}
+.tabs button {
+  flex: 1;
+  padding: 9px 10px;
+  font-size: 14px;
+}
+.tabs button.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .demo-banner {
-  padding: 8px 14px;
+  padding: 9px 14px;
   border-radius: 10px;
   background: rgb(245 179 1 / 0.12);
   border: 1px solid var(--accent-dim);
   color: var(--accent);
   font-weight: 650;
   text-align: center;
-}
-
-.tabs {
-  display: flex;
-  gap: 6px;
-}
-.tabs button {
-  padding: 8px 14px;
   font-size: 14px;
 }
-.tabs button[aria-selected="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
+.demo-banner.offline {
+  background: rgb(229 72 77 / 0.12);
+  border-color: #5c2a2d;
+  color: #ff9a9e;
 }
 
 .grid {
@@ -204,10 +256,6 @@ textarea:focus {
 .col-8 { grid-column: span 8; }
 .col-12 { grid-column: span 12; }
 
-@media (max-width: 900px) {
-  .col-4, .col-5, .col-6, .col-7, .col-8 { grid-column: span 12; }
-}
-
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -216,13 +264,33 @@ textarea:focus {
 }
 .card h2 {
   margin: 0 0 12px;
-  font-size: 13px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--muted);
 }
 
-/* ---------- status ---------- */
+.notice {
+  background: rgb(139 149 168 / 0.1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.notice.warn {
+  background: rgb(232 163 61 / 0.12);
+  border-color: var(--accent-dim);
+  color: var(--warn);
+}
+.notice.err {
+  background: rgb(229 72 77 / 0.12);
+  border-color: #5c2a2d;
+  color: #ff9a9e;
+}
+
+/* ---------------- status ---------------- */
 
 .stat-row {
   display: flex;
@@ -237,67 +305,141 @@ textarea:focus {
 }
 .stat-row span:first-child {
   color: var(--muted);
+  flex: none;
 }
 .stat-row span:last-child {
   font-variant-numeric: tabular-nums;
   text-align: right;
   word-break: break-word;
 }
+.stat-row .ok { color: var(--ok); }
+.stat-row .warn { color: var(--warn); }
+.stat-row .err { color: var(--err); }
 
 .pill {
   display: inline-block;
-  padding: 3px 9px;
+  padding: 4px 10px;
   border-radius: 999px;
   background: var(--panel-2);
   border: 1px solid var(--line);
   font-size: 12px;
   font-weight: 600;
-  text-transform: capitalize;
-}
-.pill.happy, .pill.dancing, .pill.speaking { color: var(--ok); border-color: #1f5c42; }
-.pill.sad, .pill.error { color: var(--err); border-color: #5c2a2d; }
-.pill.surprised, .pill.thinking, .pill.demonstrating { color: var(--accent); border-color: var(--accent-dim); }
-
-.expr-face {
-  font-size: 46px;
-  text-align: center;
-  line-height: 1;
-  padding: 6px 0;
 }
 
-/* ---------- d-pad ---------- */
+/* ---------------- joystick ---------------- */
 
-.dpad {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
+.drive-card {
+  display: flex;
+  flex-direction: column;
+}
+.drive-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.joystick-column {
+  flex: 0 0 auto;
+  margin: 0 auto;
+}
+.drive-side {
+  flex: 1 1 200px;
+  min-width: 180px;
+}
+
+.joystick-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: 8px;
-  user-select: none;
 }
-.dpad .spacer {
-  visibility: hidden;
+
+.joystick {
+  position: relative;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 40%, #1b2231, #0d1119);
+  border: 2px solid var(--line);
+  touch-action: none;
+  display: grid;
+  place-items: center;
+  cursor: grab;
 }
-.dpad button {
-  padding: 16px 8px;
-  font-size: 15px;
-  font-weight: 650;
+.joystick.active {
+  border-color: var(--accent);
+  cursor: grabbing;
 }
-.dpad .stop {
+.joystick.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.joystick-cross {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: #3a4557;
+  font-size: 13px;
+}
+.joystick-cross span {
+  position: absolute;
+}
+.joystick-cross .up { top: 8px; left: 50%; transform: translateX(-50%); }
+.joystick-cross .down { bottom: 8px; left: 50%; transform: translateX(-50%); }
+.joystick-cross .left { left: 8px; top: 50%; transform: translateY(-50%); }
+.joystick-cross .right { right: 8px; top: 50%; transform: translateY(-50%); }
+
+.joystick-knob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border-radius: 50%;
+  background: linear-gradient(160deg, #3b465a, #232b3a);
+  border: 2px solid #4c5a72;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.5);
+  pointer-events: none;
+  transition: transform 0.04s linear;
+}
+.joystick.active .joystick-knob {
+  border-color: var(--accent);
+}
+
+.joystick-readout {
+  font-size: 13px;
+  color: var(--muted);
+  text-align: center;
+  min-height: 20px;
+}
+
+button.stop {
+  width: 100%;
   background: #3a1f22;
   border-color: #6b2f34;
   color: #ff9a9e;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  min-height: 54px;
+  margin-bottom: 10px;
 }
-.dpad .stop:active {
+button.stop:active:not(:disabled) {
   background: #4d272b;
 }
 
-.hold-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  margin-top: 8px;
+.mini-row {
+  margin-top: 10px;
+}
+.mini-label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.mini-row .btn-row button {
+  flex: 1 1 0;
 }
 
-/* ---------- buttons ---------- */
+/* ---------------- buttons ---------------- */
 
 .btn-row {
   display: flex;
@@ -310,22 +452,21 @@ textarea:focus {
 
 .expressions {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
 }
 .expressions button {
-  padding: 12px 4px;
   font-size: 13px;
-  text-transform: capitalize;
-}
-.expressions button[aria-pressed="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
+  line-height: 1.35;
+  padding: 10px 4px;
 }
 
 .modes {
   display: grid;
   gap: 8px;
+}
+.modes > button {
+  width: 100%;
 }
 
 .switch-row {
@@ -336,22 +477,23 @@ textarea:focus {
   padding: 8px 0;
 }
 .switch {
-  width: 52px;
-  height: 30px;
+  width: 54px;
+  height: 32px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--panel-2);
   position: relative;
   padding: 0;
   flex: none;
+  min-height: 0;
 }
 .switch::after {
   content: "";
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
   background: var(--muted);
   transition: transform 0.15s, background 0.15s;
@@ -365,15 +507,16 @@ textarea:focus {
   background: var(--ok);
 }
 
-/* ---------- chat ---------- */
+/* ---------------- chat ---------------- */
 
 .chat {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 220px;
-  max-height: 42vh;
+  min-height: 180px;
+  max-height: 40vh;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   padding-right: 4px;
 }
 .bubble {
@@ -401,6 +544,7 @@ textarea:focus {
   background: none;
   border: 0;
   padding: 2px;
+  text-align: center;
 }
 .composer {
   display: flex;
@@ -409,16 +553,18 @@ textarea:focus {
 }
 .composer input {
   flex: 1;
+  min-width: 0;
 }
 
-/* ---------- activity ---------- */
+/* ---------------- activity ---------------- */
 
 .activity {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 300px;
+  max-height: 320px;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   font-size: 13px;
 }
 .activity-row {
@@ -443,7 +589,7 @@ textarea:focus {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   flex: none;
-  width: 74px;
+  width: 68px;
 }
 .activity-row .l {
   font-weight: 600;
@@ -451,6 +597,7 @@ textarea:focus {
 .activity-row .d {
   color: var(--muted);
   word-break: break-word;
+  min-width: 0;
 }
 .activity-row.error .l {
   color: var(--err);
@@ -463,32 +610,7 @@ textarea:focus {
   font-weight: 500;
 }
 
-/* ---------- camera ---------- */
-
-.camera {
-  position: relative;
-  background: #05070a;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
-  aspect-ratio: 4 / 3;
-  display: grid;
-  place-items: center;
-}
-.camera img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  display: block;
-}
-.camera .placeholder {
-  color: var(--muted);
-  font-size: 13px;
-  text-align: center;
-  padding: 16px;
-}
-
-/* ---------- settings ---------- */
+/* ---------------- settings ---------------- */
 
 .form-row {
   display: grid;
@@ -506,27 +628,38 @@ textarea:focus {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
-@media (max-width: 640px) {
-  .form-grid {
-    grid-template-columns: 1fr;
-  }
-}
 .hint {
   font-size: 12px;
   color: var(--muted);
+  margin: 0 0 8px;
 }
+.hint.ok {
+  color: var(--ok);
+}
+.hint.warn {
+  color: var(--warn);
+}
+code {
+  background: #0f131b;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 20px;
+  bottom: calc(20px + var(--safe-b));
   transform: translateX(-50%);
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 10px;
-  padding: 10px 16px;
+  padding: 11px 16px;
   font-size: 14px;
   box-shadow: 0 8px 28px rgb(0 0 0 / 0.5);
   z-index: 50;
+  max-width: calc(100vw - 32px);
 }
 .toast.err {
   border-color: #5c2a2d;
@@ -537,18 +670,61 @@ textarea:focus {
   color: #7fe0b0;
 }
 
-.discovered {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+/* ---------------- phone layout ---------------- */
+
+/* Below this the 12-column grid becomes a single column, and the joystick
+   stays large enough to drive with a thumb. */
+@media (max-width: 900px) {
+  .col-4,
+  .col-5,
+  .col-6,
+  .col-7,
+  .col-8 {
+    grid-column: span 12;
+  }
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+  .expressions {
+    grid-template-columns: repeat(3, 1fr);
+  }
 }
-.discovered button {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  text-align: left;
+
+@media (max-width: 420px) {
+  body {
+    font-size: 14px;
+  }
+  .brand h1 {
+    font-size: 17px;
+  }
+  .expressions {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .chat {
+    max-height: 34vh;
+  }
+  .activity {
+    max-height: 240px;
+  }
 }
-.discovered .addr {
-  color: var(--muted);
-  font-size: 13px;
+
+/* Landscape on a phone: the joystick and the status sit side by side so the
+   whole control surface is reachable without scrolling. */
+@media (max-height: 520px) and (orientation: landscape) {
+  .drive-layout {
+    flex-wrap: nowrap;
+  }
+  .activity {
+    max-height: 150px;
+  }
+  .chat {
+    max-height: 30vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

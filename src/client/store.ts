@@ -1,65 +1,61 @@
 /**
- * Browser-side app socket + store.
+ * App-side state, socket and REST helpers.
  *
- * The UI never talks to the ESP32 directly: it sends commands over this
- * socket and receives a stream of state / activity messages. React reads
- * `useStore` and re-renders on change.
+ * The UI never sees the binary protocol. It sends JSON commands over a
+ * WebSocket to the companion server, which frames them for the robot.
  */
 
 import { useSyncExternalStore } from "react";
-import type {
-  ActivityEntry,
-  Command,
-  ConnectionState,
-  DiscoveredRobot,
-  RobotStatus,
-  ServerMessage,
-  ServerStateMessage,
-} from "../shared/protocol.js";
-
-export interface ChatMessage {
-  id: string;
-  from: "user" | "robot" | "system";
-  text: string;
-  at: number;
-}
+import {
+  CMD,
+  type CommandId,
+  type RobotStateName,
+} from "../shared/walleProtocol.js";
+import {
+  EMPTY_STATUS,
+  SERVER_MSG,
+  type ActivityEntry,
+  type AppCommand,
+  type ChatMessage,
+  type ConnectionState,
+  type RobotStatus,
+  type ServerMessage,
+  type ServerStateMessage,
+} from "../shared/walleTypes.js";
 
 export interface AppStore {
-  connected: boolean;
+  /** True when the browser is talking to the companion server. */
+  socketConnected: boolean;
   connection: ConnectionState;
   demoMode: boolean;
   robotName: string;
   target: ServerStateMessage["target"];
   status: RobotStatus | null;
   lastError: { code: string; message: string } | null;
-  robots: DiscoveredRobot[];
   activity: ActivityEntry[];
   chat: ChatMessage[];
-  /** True while a movement command is latched, so the UI can show STOP. */
-  moving: boolean;
-  busy: boolean;
-  camera: { status: "idle" | "starting" | "live" | "snapshots" | "error"; streamUrl?: string; error?: string };
-  frame: string | null;
+  driving: boolean;
+  /** Set when the robot refuses movement, e.g. it is speaking. */
+  blocked: string | null;
+  settings: AppSettings | null;
 }
 
 const ACTIVITY_LIMIT = 200;
-const CHAT_LIMIT = 100;
+const CHAT_LIMIT = 60;
 
 let state: AppStore = {
-  connected: false,
+  socketConnected: false,
   connection: "disconnected",
   demoMode: false,
   robotName: "WALL-E",
   target: null,
-  status: null,
+  status: { ...EMPTY_STATUS },
   lastError: null,
-  robots: [],
   activity: [],
   chat: [],
-  moving: false,
-  busy: false,
-  camera: { status: "idle" },
-  frame: null,
+  driving: false,
+  blocked: null,
+  settings: null,
 };
 
 const listeners = new Set<() => void>();
@@ -75,7 +71,9 @@ function setState(patch: Partial<AppStore>): void {
 
 function subscribe(cb: () => void): () => void {
   listeners.add(cb);
-  return () => listeners.delete(cb);
+  return () => {
+    listeners.delete(cb);
+  };
 }
 
 export function useStore<T>(selector: (s: AppStore) => T): T {
@@ -97,11 +95,11 @@ export function getState(): AppStore {
 let socket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let tokenPromise: Promise<string> | null = null;
+let msgCounter = 0;
 
 /**
- * The app socket is authenticated with a per-boot token. It is fetched from
- * the companion server on the same origin rather than baked into the bundle,
- * so nothing secret ships to the browser.
+ * The app socket is authenticated with a per-boot token, fetched from the
+ * companion server on its own origin so nothing secret ships in the bundle.
  */
 function appToken(): Promise<string> {
   tokenPromise ??= fetch("/api/session")
@@ -117,14 +115,29 @@ export function connectAppSocket(): () => void {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const base = `${proto}://${location.host}/ws`;
 
-  const open = (token: string) => {
-    const url = token ? `${base}?token=${encodeURIComponent(token)}` : base;
-    const ws = new WebSocket(url);
+  void appToken().then((token) => {
+    const ws = new WebSocket(token ? `${base}?token=${encodeURIComponent(token)}` : base);
     socket = ws;
-    wireSocket(ws);
-  };
 
-  void appToken().then(open);
+    ws.onopen = () => setState({ socketConnected: true });
+    ws.onclose = () => {
+      setState({ socketConnected: false, connection: "disconnected", driving: false });
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = window.setTimeout(connectAppSocket, 1500);
+    };
+    ws.onerror = () => {
+      /* onclose follows and drives the retry */
+    };
+    ws.onmessage = (ev) => {
+      let msg: ServerMessage;
+      try {
+        msg = JSON.parse(ev.data as string) as ServerMessage;
+      } catch {
+        return; // ignore junk
+      }
+      applyMessage(msg);
+    };
+  });
 
   return () => {
     window.clearTimeout(reconnectTimer);
@@ -133,80 +146,38 @@ export function connectAppSocket(): () => void {
   };
 }
 
-function wireSocket(ws: WebSocket): void {
-
-  ws.onopen = () => setState({ connected: true });
-  ws.onclose = () => {
-    setState({ connected: false, connection: "disconnected", moving: false, busy: false });
-    window.clearTimeout(reconnectTimer);
-    reconnectTimer = window.setTimeout(connectAppSocket, 1500);
-  };
-  ws.onerror = () => {
-    /* onclose follows and drives the retry */
-  };
-  ws.onmessage = (ev) => {
-    let msg: ServerMessage;
-    try {
-      msg = JSON.parse(ev.data as string) as ServerMessage;
-    } catch {
-      return; // ignore junk from the socket
-    }
-    applyMessage(msg);
-  };
-}
-
 function applyMessage(msg: ServerMessage): void {
   switch (msg.type) {
-    case "server_state": {
-      const status: RobotStatus | null = msg.status;
+    case SERVER_MSG.STATE:
       setState({
         connection: msg.connection,
         demoMode: msg.demoMode,
         robotName: msg.robotName,
         target: msg.target,
-        status,
-        lastError: msg.lastError,
-        // The link owns truth about movement; reflect it rather than guessing.
-        moving: status ? status.state === "moving" : state.moving,
-        busy: false,
+        status: msg.status ?? state.status,
+        lastError: msg.connection === "connected" ? null : msg.lastError,
+        driving: msg.driving,
+        blocked: msg.blocked,
       });
       break;
-    }
-    case "robots":
-      setState({ robots: msg.robots });
-      break;
-    case "camera": {
-      const cam = msg.camera;
-      setState({
-        camera: {
-          status: cam.status,
-          streamUrl: "streamUrl" in cam ? cam.streamUrl : undefined,
-          error: "error" in cam ? cam.error : undefined,
-        },
-        frame:
-          "frame" in msg && msg.frame
-            ? `data:${msg.frame.mime};base64,${msg.frame.data}`
-            : cam.status === "live"
-              ? null
-              : state.frame,
-      });
-      break;
-    }
-    case "activity": {
+
+    case SERVER_MSG.ACTIVITY: {
       const entry = msg.entry;
       const activity = [entry, ...state.activity].slice(0, ACTIVITY_LIMIT);
       let chat = state.chat;
-      if (entry.kind === "command" && (entry.label === "ask" || entry.label === "speak")) {
-        chat = [
-          ...chat,
-          { id: entry.id, from: "user" as const, text: entry.detail ?? "", at: entry.at },
-        ].slice(-CHAT_LIMIT);
+
+      // The user typed something.
+      if (entry.kind === "command" && (entry.label.startsWith("ask:") || entry.label.startsWith("speak:"))) {
+        const text = entry.label.slice(entry.label.indexOf(":") + 1).trim();
+        chat = [...chat, { id: entry.id, from: "user" as const, text, at: entry.at }].slice(
+          -CHAT_LIMIT,
+        );
       }
+      // WALL-E spoke.
       if (entry.kind === "event" && entry.label === "WALL-E" && entry.detail) {
-        chat = [
-          ...chat,
-          { id: entry.id, from: "robot" as const, text: entry.detail, at: entry.at },
-        ].slice(-CHAT_LIMIT);
+        chat = [...chat, { id: entry.id, from: "robot" as const, text: entry.detail, at: entry.at }].slice(
+          -CHAT_LIMIT,
+        );
       }
       setState({ activity, chat });
       break;
@@ -214,39 +185,106 @@ function applyMessage(msg: ServerMessage): void {
   }
 }
 
-export function sendCommand(command: Command, requestId?: string): void {
-  const id = requestId ?? `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-  const envelope = {
-    type: "command",
-    v: 1,
-    command: command.command,
-    payload: command.payload,
-    requestId: id,
-    timestamp: Date.now(),
-  };
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(envelope));
-  }
-  const optimistic = makeOptimisticActivity(command, id);
-  if (optimistic) {
-    setState({ activity: [optimistic, ...state.activity].slice(0, ACTIVITY_LIMIT) });
-  }
+/* ------------------------------------------------------------------ *
+ * Commands
+ * ------------------------------------------------------------------ */
+
+export function sendAppCommand(command: AppCommand): void {
+  if (socket?.readyState !== WebSocket.OPEN) return;
+  const requestId = `ui-${Date.now().toString(36)}-${++msgCounter}`;
+  socket.send(JSON.stringify({ type: "command", v: 1, command, requestId, timestamp: Date.now() }));
 }
 
-/** Echo the user's own message immediately; the robot reply comes via events. */
-function makeOptimisticActivity(command: Command, requestId: string): ActivityEntry | null {
-  const at = Date.now();
-  if (command.command === "ask" || command.command === "speak") {
-    const text = command.payload.text;
-    if (!text) return null;
-    return { id: requestId, at, kind: "command", label: "ask", detail: text, level: "debug", requestId };
-  }
-  return { id: requestId, at, kind: "command", label: command.command, level: "debug", requestId };
+/* ---- movement ---- */
+
+/** Press a direction. Starts the robot's 700 ms watchdog being fed. */
+export function driveStart(command: CommandId): void {
+  sendAppCommand({ name: "drive", command, held: true });
+}
+
+/**
+ * Release a direction. This is what actually stops the robot, so it is the
+ * one call that must never be skipped. The server also disarms its keepalive.
+ */
+export function driveEnd(): void {
+  sendAppCommand({ name: "stop" });
+}
+
+export function emergencyStop(): void {
+  sendAppCommand({ name: "stop" });
+}
+
+/* ---- timed motions ---- */
+
+export function moveSteps(steps: number): void {
+  sendAppCommand({ name: "move_steps", steps });
+}
+
+export function turnDegrees(degrees: number): void {
+  sendAppCommand({ name: "turn_degrees", degrees });
+}
+
+export function turnAround(): void {
+  sendAppCommand({ name: "turn_around" });
+}
+
+export function readSensor(): void {
+  sendAppCommand({ name: "read_sensor" });
+}
+
+/* ---- modes and expressions ---- */
+
+export function dance(): void {
+  sendAppCommand({ name: "simple", command: CMD.DANCE });
+}
+
+export function explore(): void {
+  sendAppCommand({ name: "simple", command: CMD.EXPLORE });
+}
+
+export function setIdle(): void {
+  sendAppCommand({ name: "simple", command: CMD.IDLE });
+}
+
+export function setAutonomous(enabled: boolean): void {
+  sendAppCommand({ name: "autonomous", enabled });
+}
+
+export function setExpression(command: CommandId): void {
+  sendAppCommand({ name: "expression", command });
+}
+
+/* ---- voice ---- */
+
+export function ask(text: string): void {
+  sendAppCommand({ name: "ask", text });
+}
+
+export function speak(text: string): void {
+  sendAppCommand({ name: "speak", text });
+}
+
+export function talk(): void {
+  sendAppCommand({ name: "simple", command: CMD.TALK });
+}
+
+export function joke(): void {
+  sendAppCommand({ name: "simple", command: CMD.JOKE });
 }
 
 /* ------------------------------------------------------------------ *
- * REST helpers
+ * REST
  * ------------------------------------------------------------------ */
+
+export interface AppSettings {
+  robotName: string;
+  host: string | null;
+  port: number;
+  autoReconnect: boolean;
+  stepCount: number;
+  sensorPollMs: number;
+  demoMode: boolean;
+}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -266,27 +304,22 @@ export const api = {
   saveSettings: (patch: Partial<AppSettings>) =>
     req<AppSettings>("/api/settings", { method: "PUT", body: JSON.stringify(patch) }),
   connect: (host: string, port: number) =>
-    req<{ connected: boolean }>("/api/connect", {
+    req<{ ok: boolean }>("/api/connect", {
       method: "POST",
-      body: JSON.stringify({ host, port, method: "manual" }),
+      body: JSON.stringify({ host, port }),
     }),
-  discover: () => req<{ robots: DiscoveredRobot[] }>("/api/discover"),
-  connectMdns: () => req<{ connected: boolean }>("/api/connect", { method: "POST", body: JSON.stringify({ method: "mdns" }) }),
   disconnect: () => req<{ ok: boolean }>("/api/disconnect", { method: "POST" }),
   demo: (enabled: boolean) =>
     req<{ demoMode: boolean }>("/api/demo", { method: "POST", body: JSON.stringify({ enabled }) }),
   activity: () => req<{ entries: ActivityEntry[] }>("/api/activity"),
+  scan: () => req<{ note: string; configuredHost: string | null }>("/api/scan"),
 };
 
-export interface AppSettings {
-  robotName: string;
-  host: string | null;
-  port: number;
-  connectionMethod: "mdns" | "manual" | "demo";
-  autoReconnect: boolean;
-  motorSpeed: number;
-  volume: number;
-  demoMode: boolean;
-  cameraEnabled: boolean;
-  geminiConfigured: boolean;
+export function loadSettings(): Promise<void> {
+  return api
+    .settings()
+    .then((s) => setState({ settings: s }))
+    .catch(() => {});
 }
+
+export type { RobotStatus, RobotStateName, ActivityEntry, ChatMessage, ConnectionState };

@@ -1,14 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { useStore, sendCommand } from "../store.js";
-import { COMMANDS } from "../../shared/protocol.js";
+import { ask, speak, useStore } from "../store.js";
 import { timeOf } from "./common.js";
+import type { ActivityEntry } from "../../shared/walleTypes.js";
 
+/**
+ * Ask WALL-E a question.
+ *
+ * The robot has no microphone, so speech input is the phone's job and
+ * transcription is not available here. Typing sends `ask`, which the robot
+ * answers with its own Gemini call and then speaks out loud; the answer comes
+ * back as a text frame and lands in the transcript.
+ */
 export function ChatPanel() {
   const connected = useStore((s) => s.connection === "connected");
   const chat = useStore((s) => s.chat);
-  const listening = useStore((s) => s.status?.state === "listening");
-  const thinking = useStore((s) => s.status?.state === "thinking");
-  const speaking = useStore((s) => s.status?.state === "speaking");
+  const blocked = useStore((s) => s.blocked);
+  const state = useStore((s) => s.status?.state);
   const [text, setText] = useState("");
   const [history, setHistory] = useState<string[]>([]);
   const endRef = useRef<HTMLDivElement>(null);
@@ -20,12 +27,13 @@ export function ChatPanel() {
   const submit = () => {
     const value = text.trim();
     if (!value) return;
-    sendCommand({ command: COMMANDS.ASK, payload: { text: value } });
-    setHistory((h) => [value, ...h].slice(0, 10));
+    ask(value);
+    setHistory((h) => [value, ...h].filter((v, i, a) => a.indexOf(v) === i).slice(0, 6));
     setText("");
   };
 
-  const micState = listening ? "Listening…" : thinking ? "Thinking…" : speaking ? "Speaking…" : null;
+  const phase =
+    state === "thinking" ? "WALL-E is thinking…" : state === "speaking" ? "WALL-E is speaking…" : null;
 
   return (
     <div className="card col-7">
@@ -34,7 +42,7 @@ export function ChatPanel() {
       <div className="chat">
         {chat.length === 0 ? (
           <div className="bubble system">
-            Ask WALL-E something, e.g. “Tell me a joke.” The robot handles STT → Gemini → TTS.
+            Type a question. WALL-E answers with its own Gemini and says it out loud.
           </div>
         ) : (
           chat.map((m) => (
@@ -49,7 +57,7 @@ export function ChatPanel() {
       <div className="composer">
         <input
           value={text}
-          placeholder={connected ? "Message WALL-E…" : "Not connected"}
+          placeholder={connected ? "Ask WALL-E something…" : "Not connected"}
           disabled={!connected}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -57,22 +65,26 @@ export function ChatPanel() {
           }}
         />
         <button className="primary" disabled={!connected || !text.trim()} onClick={submit}>
-          Send
+          Ask
         </button>
         <button
-          disabled={!connected}
-          title="Start listening on the robot microphone"
-          onClick={() => sendCommand({ command: COMMANDS.LISTEN, payload: {} })}
+          disabled={!connected || !text.trim() || !!phase}
+          title="Say this exact line, no AI"
+          onClick={() => {
+            speak(text.trim());
+            setText("");
+          }}
         >
-          {micState ? "…" : "Talk"}
+          Say
         </button>
       </div>
 
-      {micState ? <p className="hint">{micState}</p> : null}
+      {phase ? <p className="hint">{phase}</p> : null}
+      {blocked ? <p className="hint warn">{blocked}</p> : null}
 
       {history.length > 0 ? (
         <div className="btn-row" style={{ marginTop: 8 }}>
-          {history.slice(0, 4).map((h) => (
+          {history.slice(0, 3).map((h) => (
             <button key={h} className="ghost" onClick={() => setText(h)}>
               {h}
             </button>
@@ -83,16 +95,33 @@ export function ChatPanel() {
   );
 }
 
+/**
+ * Compact event log.
+ *
+ * The robot re-sends its state about once a second as a keepalive floor, and
+ * the integration doc explicitly warns against treating each one as a screen
+ * update, so consecutive duplicates are collapsed into a single line.
+ */
 export function ActivityPanel() {
   const activity = useStore((s) => s.activity);
   const [showDebug, setShowDebug] = useState(false);
 
-  const rows = activity.filter((a) => showDebug || a.level !== "debug").slice(0, 120);
+  const filtered = activity.filter((a) => showDebug || a.level !== "debug");
+
+  const collapsed: (ActivityEntry & { count: number })[] = [];
+  for (const entry of filtered) {
+    const last = collapsed[collapsed.length - 1];
+    if (last && last.label === entry.label && entry.at - last.at < 3000) {
+      last.count += 1;
+      continue;
+    }
+    collapsed.push({ ...entry, count: 1 });
+  }
 
   return (
     <div className="card col-5">
       <h2>
-        Activity{" "}
+        Activity
         <button
           className="ghost"
           style={{ float: "right", padding: "2px 8px", fontSize: 12 }}
@@ -102,15 +131,16 @@ export function ActivityPanel() {
         </button>
       </h2>
       <div className="activity">
-        {rows.length === 0 ? (
+        {collapsed.length === 0 ? (
           <div className="hint">No activity yet.</div>
         ) : (
-          rows.map((a) => (
+          collapsed.slice(0, 120).map((a) => (
             <div key={a.id} className={`activity-row ${a.level ?? "info"}`}>
               <span className="t">{timeOf(a.at)}</span>
               <span className="k">{a.kind}</span>
               <span className="l">{a.label}</span>
               {a.detail ? <span className="d">{a.detail}</span> : null}
+              {a.count > 1 ? <span className="d">x{a.count}</span> : null}
             </div>
           ))
         )}

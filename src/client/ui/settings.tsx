@@ -1,44 +1,83 @@
 import { useEffect, useState } from "react";
-import { api, useStore, sendCommand, type AppSettings } from "../store.js";
-import { COMMANDS, DEFAULT_ROBOT_PORT, type DiscoveredRobot } from "../../shared/protocol.js";
+import { DEFAULT_ROBOT_PORT, ROBOT_STATE } from "../../shared/walleProtocol.js";
+import { api, readSensor, useStore } from "../store.js";
+import { timeOf } from "./common.js";
 
+const CONNECTION_LABEL: Record<string, string> = {
+  disconnected: "Disconnected",
+  connecting: "Connecting",
+  connected: "Connected",
+  reconnecting: "Reconnecting",
+  error: "Error",
+};
+
+/**
+ * Robot status.
+ *
+ * Everything here is derived from binary status frames. The battery row only
+ * appears if the robot ever reports a real reading, because the current
+ * firmware has no battery sensor and a fake gauge would be worse than none.
+ */
 export function RobotInfoPanel() {
   const status = useStore((s) => s.status);
   const target = useStore((s) => s.target);
-  const demoMode = useStore((s) => s.demoMode);
   const connection = useStore((s) => s.connection);
+  const demoMode = useStore((s) => s.demoMode);
   const name = useStore((s) => s.robotName);
+  const driving = useStore((s) => s.driving);
+
+  const cliff = status?.cliffName ?? "unknown";
+  const cliffClass =
+    cliff === "ground" ? "ok" : cliff === "warn" ? "warn" : cliff === "unknown" ? "" : "err";
 
   const rows: [string, React.ReactNode][] = [
-    ["Robot name", name],
-    ["Connection", connection],
-    ["IP", demoMode ? "demo (simulated)" : (status?.ip ?? target?.host ?? "—")],
-    ["Firmware", status?.firmwareVersion ?? "—"],
-    ["Wi-Fi", status?.wifiRssi !== undefined ? `${status.wifiRssi} dBm` : "—"],
+    ["Robot", name],
+    ["Link", CONNECTION_LABEL[connection] ?? connection],
+    ["IP", target ? `${target.host}:${target.port}` : "—"],
     ["State", status?.state ?? "—"],
-    ["Mode", status?.mode ?? "—"],
-    ["Autonomous", status?.autonomous ? "ON" : "OFF"],
-    // Shown only when the firmware actually reports a battery sensor.
-    ...(status?.battery
-      ? ([
-          [
-            "Battery",
-            `${status.battery.percent}%${status.battery.charging ? " (charging)" : ""}${
-              status.battery.millivolts ? ` · ${status.battery.millivolts} mV` : ""
-            }`,
-          ],
-        ] as [string, React.ReactNode][])
+    [
+      "Wheels",
+      status?.wheelsBlocked
+        ? "Locked — talking"
+        : driving
+          ? "App is driving"
+          : status?.remoteHasControl
+            ? "Radio remote"
+            : "Free",
+    ],
+    ["Mode", status?.autonomous ? "Autonomous" : "Manual"],
+    ["Floor", `${cliff} · ${status?.groundCm ?? 0} cm`],
+    ["Radio remote", status?.remoteState ?? "—"],
+    ...(status?.batteryMillivolts
+      ? ([["Battery", `${(status.batteryMillivolts / 1000).toFixed(2)} V`]] as [
+          string,
+          React.ReactNode,
+        ][])
       : []),
-    ["Heap free", status?.freeHeap ? `${(status.freeHeap / 1024).toFixed(1)} KB` : "—"],
   ];
 
   return (
     <div className="card col-4">
       <h2>Robot</h2>
+
+      {status?.wheelsBlocked ? (
+        <div className="notice warn">
+          WALL-E is {status.state}. It will not move while it is thinking or speaking.
+        </div>
+      ) : null}
+      {cliff === "drop" || cliff === "fault" ? (
+        <div className="notice err">
+          {cliff === "drop"
+            ? "No floor detected — WALL-E has stopped."
+            : "Distance sensor is not responding — WALL-E has stopped."}
+        </div>
+      ) : null}
+      {demoMode ? null : null}
+
       {rows.map(([k, v]) => (
         <div className="stat-row" key={k}>
           <span>{k}</span>
-          <span>{v}</span>
+          <span className={k === "Floor" ? cliffClass : ""}>{v}</span>
         </div>
       ))}
     </div>
@@ -47,55 +86,30 @@ export function RobotInfoPanel() {
 
 export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "err") => void }) {
   const connection = useStore((s) => s.connection);
-  const robots = useStore((s) => s.robots);
   const demoMode = useStore((s) => s.demoMode);
   const target = useStore((s) => s.target);
+  const status = useStore((s) => s.status);
   const [host, setHost] = useState("");
   const [port, setPort] = useState(DEFAULT_ROBOT_PORT);
-  const [scanning, setScanning] = useState(false);
-  const [settings, setSettings] = useState<AppSettings | null>(null);
 
   useEffect(() => {
     void api
       .settings()
       .then((s) => {
-        setSettings(s);
         if (s.host) setHost(s.host);
         setPort(s.port);
       })
       .catch(() => {});
   }, []);
 
-  const scan = async () => {
-    setScanning(true);
-    try {
-      const { robots: found } = await api.discover();
-      if (found.length === 0) notify("No WALL-E found on this network. Use manual IP entry.");
-      else notify(`Found ${found.length} robot(s).`);
-    } catch (err) {
-      notify((err as Error).message, "err");
-    } finally {
-      setScanning(false);
-    }
-  };
-
-  const connectManual = async () => {
-    if (!host.trim()) return notify("Enter an IP address or hostname", "err");
+  const connect = async () => {
+    if (!host.trim()) return notify("Enter the IP from WALL-E's serial log", "err");
     try {
       await api.connect(host.trim(), Number(port) || DEFAULT_ROBOT_PORT);
       notify("Connecting…");
     } catch (err) {
       notify((err as Error).message, "err");
     }
-  };
-
-  const useRobot = (robot: DiscoveredRobot) => {
-    setHost(robot.host);
-    setPort(robot.port);
-    void api
-      .connect(robot.host, robot.port)
-      .then(() => notify(`Connecting to ${robot.name}…`))
-      .catch((err: Error) => notify(err.message, "err"));
   };
 
   const toggleDemo = async () => {
@@ -111,45 +125,23 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
     <div className="card col-8">
       <h2>Connection</h2>
 
-      <div className="btn-row">
-        <button onClick={scan} disabled={scanning}>
-          {scanning ? "Scanning…" : "Scan for WALL-E"}
-        </button>
-        <button
-          onClick={() => void api.connectMdns().then(() => notify("Connecting to discovered robot…")).catch((e: Error) => notify(e.message, "err"))}
-        >
-          Auto-connect
-        </button>
-        <button className={demoMode ? "on" : ""} onClick={toggleDemo}>
-          {demoMode ? "Demo mode: ON" : "Demo mode: OFF"}
-        </button>
-        <button className="danger" disabled={connection === "disconnected"} onClick={() => void api.disconnect()}>
-          Disconnect
-        </button>
+      <div className="notice">
+        WALL-E does not broadcast on the network. Its IP address is printed on the
+        serial log at boot. Type it once and the app remembers it.
       </div>
 
-      {robots.length > 0 ? (
-        <div className="discovered" style={{ marginTop: 10 }}>
-          {robots.map((r) => (
-            <button key={r.id} onClick={() => useRobot(r)}>
-              <span>
-                <strong>{r.name}</strong> <span className="addr">{r.host}</span>
-              </span>
-              <span className="addr">connect →</span>
-            </button>
-          ))}
-        </div>
-      ) : null}
-
-      <div className="form-grid" style={{ marginTop: 12 }}>
+      <div className="form-grid">
         <div className="form-row">
-          <label htmlFor="ip">IP address or hostname</label>
+          <label htmlFor="ip">IP address</label>
           <input
             id="ip"
             value={host}
-            placeholder="192.168.1.42 or wall-e.local"
+            placeholder="192.168.1.42"
+            inputMode="decimal"
+            autoCapitalize="off"
+            autoCorrect="off"
             onChange={(e) => setHost(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && connectManual()}
+            onKeyDown={(e) => e.key === "Enter" && connect()}
           />
         </div>
         <div className="form-row">
@@ -158,55 +150,61 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
             <input
               id="port"
               type="number"
+              inputMode="numeric"
               value={port}
               onChange={(e) => setPort(Number(e.target.value))}
             />
-            <button className="primary" onClick={connectManual}>
+            <button className="primary" onClick={connect}>
               Connect
             </button>
           </div>
         </div>
       </div>
 
+      <div className="btn-row">
+        <button className={demoMode ? "on" : ""} onClick={toggleDemo}>
+          {demoMode ? "Demo mode: ON" : "Demo mode: OFF"}
+        </button>
+        <button className="danger" disabled={connection === "disconnected"} onClick={() => void api.disconnect()}>
+          Disconnect
+        </button>
+        <button disabled={connection !== "connected"} onClick={readSensor}>
+          Read sensor
+        </button>
+      </div>
+
       {target ? (
-        <p className="hint" style={{ margin: 0 }}>
-          Target: {target.host}:{target.port} ({target.source})
+        <p className="hint" style={{ marginBottom: 0 }}>
+          Connected over raw TCP to {target.host}:{target.port} · state{" "}
+          {status?.state ?? "unknown"} ({status?.stateCode ?? 0})
         </p>
       ) : null}
-      {settings ? <p className="hint" style={{ margin: 0 }}>Saved host: {settings.host ?? "none yet"}</p> : null}
     </div>
   );
 }
 
 export function SettingsPanel({ notify }: { notify: (m: string, k?: "ok" | "err") => void }) {
-  const connected = useStore((s) => s.connection === "connected");
-  const status = useStore((s) => s.status);
-  const [s, setS] = useState<AppSettings | null>(null);
-  const [key, setKey] = useState("");
+  const [s, setS] = useState<Awaited<ReturnType<typeof api.settings>> | null>(null);
 
   useEffect(() => {
     void api.settings().then(setS).catch(() => {});
   }, []);
 
-  if (!s) return <div className="card col-6"><h2>Settings</h2><div className="hint">Loading…</div></div>;
+  if (!s) {
+    return (
+      <div className="card col-6">
+        <h2>Settings</h2>
+        <div className="hint">Loading…</div>
+      </div>
+    );
+  }
 
-  const patch = async (next: Partial<AppSettings>) => {
+  const patch = async (next: Partial<typeof s>) => {
     try {
-      const saved = await api.saveSettings(next);
-      setS(saved);
+      setS(await api.saveSettings(next));
     } catch (err) {
       notify((err as Error).message, "err");
     }
-  };
-
-  const saveKey = async () => {
-    if (!key.trim()) return;
-    // Sent once to the local companion server over loopback/LAN; stored in the
-    // server process env, never in the browser bundle and never sent to the robot.
-    const saved = await api.saveSettings({ geminiApiKey: key.trim() } as Partial<AppSettings>);
-    setS(saved);
-    setKey("");
-    notify("API key saved on the companion server");
   };
 
   return (
@@ -219,60 +217,37 @@ export function SettingsPanel({ notify }: { notify: (m: string, k?: "ok" | "err"
           <input
             id="name"
             defaultValue={s.robotName}
-            onBlur={(e) => e.target.value !== s.robotName && patch({ robotName: e.target.value })}
+            onBlur={(e) => e.target.value !== s.robotName && void patch({ robotName: e.target.value })}
           />
         </div>
         <div className="form-row">
-          <label htmlFor="cm">Connection method</label>
-          <select
-            id="cm"
-            value={s.connectionMethod}
-            onChange={(e) => patch({ connectionMethod: e.target.value as AppSettings["connectionMethod"] })}
-          >
-            <option value="mdns">Auto (mDNS)</option>
-            <option value="manual">Manual IP</option>
-            <option value="demo">Demo only</option>
-          </select>
+          <label htmlFor="port2">Robot port</label>
+          <input
+            id="port2"
+            type="number"
+            defaultValue={s.port}
+            onBlur={(e) => e.target.value !== String(s.port) && void patch({ port: Number(e.target.value) })}
+          />
         </div>
       </div>
 
-      <div className="form-grid">
-        <div className="form-row">
-          <label htmlFor="ms">Motor speed — {(s.motorSpeed * 100).toFixed(0)}%</label>
-          <input
-            id="ms"
-            type="range"
-            min={0}
-            max={1}
-            step={0.05}
-            defaultValue={s.motorSpeed}
-            onChange={(e) => {
-              const v = Number(e.target.value);
-              setS({ ...s, motorSpeed: v });
-              if (connected) sendCommand({ command: COMMANDS.SET_MOTOR_SPEED, payload: { speed: v } });
-            }}
-            onMouseUp={() => void patch({ motorSpeed: s.motorSpeed })}
-            onTouchEnd={() => void patch({ motorSpeed: s.motorSpeed })}
-          />
-        </div>
-        <div className="form-row">
-          <label htmlFor="vol">Volume — {((s.volume ?? 0.7) * 100).toFixed(0)}%</label>
-          <input
-            id="vol"
-            type="range"
-            min={0}
-            max={1}
-            step={0.05}
-            defaultValue={s.volume}
-            onChange={(e) => {
-              const v = Number(e.target.value);
-              setS({ ...s, volume: v });
-              if (connected) sendCommand({ command: COMMANDS.SET_VOLUME, payload: { volume: v } });
-            }}
-            onMouseUp={() => void patch({ volume: s.volume })}
-            onTouchEnd={() => void patch({ volume: s.volume })}
-          />
-        </div>
+      <div className="form-row">
+        <label htmlFor="poll">
+          Sensor poll — {s.sensorPollMs === 0 ? "off" : `${s.sensorPollMs} ms`}
+        </label>
+        <input
+          id="poll"
+          type="range"
+          min={0}
+          max={1000}
+          step={100}
+          defaultValue={s.sensorPollMs}
+          onChange={(e) => void patch({ sensorPollMs: Number(e.target.value) })}
+        />
+        <span className="hint">
+          Each poll is a real ultrasonic echo on the robot. 200 ms is about 5 Hz,
+          which is the useful ceiling. 0 disables polling.
+        </span>
       </div>
 
       <div className="switch-row">
@@ -285,34 +260,17 @@ export function SettingsPanel({ notify }: { notify: (m: string, k?: "ok" | "err"
           role="switch"
           aria-checked={s.autoReconnect}
           aria-label="Auto reconnect"
-          onClick={() => patch({ autoReconnect: !s.autoReconnect })}
+          onClick={() => void patch({ autoReconnect: !s.autoReconnect })}
         />
       </div>
 
-      <div className="form-row">
-        <label htmlFor="gk">Gemini API key {s.geminiConfigured ? "— configured on server" : "— not set"}</label>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            id="gk"
-            type="password"
-            value={key}
-            placeholder="paste key to store server-side"
-            onChange={(e) => setKey(e.target.value)}
-          />
-          <button onClick={saveKey} disabled={!key.trim()}>
-            Save
-          </button>
-        </div>
-        <span className="hint">
-          Held by the companion server only. Without a key the app answers from a small
-          offline reply set, so demos still work.
-        </span>
-      </div>
-
       <p className="hint" style={{ marginBottom: 0 }}>
-        STT and TTS run on the robot itself; the app only shows their status
-        {status ? ` (currently ${status.state})` : ""}.
+        There is no API key on this side. The robot holds its own Gemini key and
+        runs its own speech pipeline — the app only sends{" "}
+        <code>ask</code> and receives the answer.
       </p>
     </div>
   );
 }
+
+export { timeOf, ROBOT_STATE };

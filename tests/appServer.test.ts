@@ -1,13 +1,14 @@
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { createAppServer } from "../src/server/appServer.js";
-import { loadConfig, type AppConfig } from "../src/server/config.js";
-import { SettingsStore, DEFAULT_SETTINGS } from "../src/server/storage/settingsStore.js";
-import { GEMINI_KEY_SENTINEL } from "./helpers.js";
+import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest";
 import WebSocket from "ws";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ServerMessage } from "../src/shared/protocol.js";
+import { AppServer } from "../src/server/appServer.js";
+import { createAppServer } from "../src/server/appServer.js";
+import { loadConfig, type AppConfig } from "../src/server/config.js";
+import { SettingsStore, DEFAULT_SETTINGS } from "../src/server/storage/settingsStore.js";
+import { CMD, CLIFF } from "../src/shared/walleProtocol.js";
+import { SERVER_MSG, type ServerMessage } from "../src/shared/walleTypes.js";
 
 function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
@@ -15,34 +16,22 @@ function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     port: 0,
     host: "127.0.0.1",
     appToken: "test-token",
-    robotToken: undefined,
-    geminiApiKey: undefined,
-    requestTimeoutMs: 2000,
-    discovery: { enabled: false, timeoutMs: 100 },
-    rateLimit: { windowMs: 1000, maxCommands: 200 },
+    defaultRobotHost: null,
     demoMode: false,
-    lastKnownHost: null,
+    rateLimit: { windowMs: 1000, maxCommands: 500 },
     ...overrides,
   };
 }
 
-/**
- * Connect an app client to the server's /ws endpoint.
- *
- * The message listener is attached synchronously at construction so the
- * server's immediate state/robots/activity frames are never missed — the app
- * does not wait for a client to announce itself before pushing.
- */
-function openAppSocket(port: number, token = "test-token"): Promise<{ ws: WebSocket; msgs: ServerMessage[] }> {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${token}`);
-  const msgs = collect(ws);
-  return new Promise((resolve, reject) => {
-    ws.once("open", () => resolve({ ws, msgs }));
-    ws.once("error", reject);
-  });
+interface Client {
+  ws: WebSocket;
+  msgs: ServerMessage[];
+  send: (name: string, extra?: Record<string, unknown>) => void;
+  close: () => void;
 }
 
-function collect(ws: WebSocket): ServerMessage[] {
+async function openClient(port: number, token = "test-token"): Promise<Client> {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=${token}`);
   const msgs: ServerMessage[] = [];
   ws.on("message", (raw) => {
     try {
@@ -51,10 +40,29 @@ function collect(ws: WebSocket): ServerMessage[] {
       /* ignore */
     }
   });
-  return msgs;
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", () => resolve());
+    ws.once("error", reject);
+  });
+  let n = 0;
+  return {
+    ws,
+    msgs,
+    send: (name, extra = {}) =>
+      ws.send(
+        JSON.stringify({
+          type: "command",
+          v: 1,
+          command: { name, ...extra },
+          requestId: `t${++n}`,
+          timestamp: Date.now(),
+        }),
+      ),
+    close: () => ws.close(),
+  };
 }
 
-async function until<T>(fn: () => T | undefined | false, timeoutMs = 4000): Promise<T | undefined> {
+async function until<T>(fn: () => T | undefined | false, timeoutMs = 5000): Promise<T | undefined> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const v = fn();
@@ -64,18 +72,29 @@ async function until<T>(fn: () => T | undefined | false, timeoutMs = 4000): Prom
   return undefined;
 }
 
+const lastState = (c: Client) => {
+  const s = [...c.msgs].reverse().find((m) => m.type === SERVER_MSG.STATE);
+  return s?.type === SERVER_MSG.STATE ? s : undefined;
+};
+
+const hasActivity = (c: Client, label: string | RegExp) =>
+  c.msgs.some(
+    (m) =>
+      m.type === SERVER_MSG.ACTIVITY &&
+      (typeof label === "string" ? m.entry.label === label : label.test(m.entry.label)),
+  );
+
 describe("AppServer in demo mode", () => {
-  let server: ReturnType<typeof createAppServer>;
+  let server: AppServer;
   let port: number;
   let tmp: string;
 
   beforeAll(async () => {
     tmp = mkdtempSync(join(tmpdir(), "walle-test-"));
-    const config = testConfig();
-    // Point settings at a temp dir so tests never touch the real .walle folder.
-    process.env.WALLE_APP_TOKEN = "test-token";
-    server = createAppServer(config);
-    (server as unknown as { settings: SettingsStore }).settings = new SettingsStore(join(tmp, "settings.json"));
+    server = createAppServer(testConfig());
+    (server as unknown as { settings: SettingsStore }).settings = new SettingsStore(
+      join(tmp, "settings.json"),
+    );
     await server.start();
     await server.startDemoMode();
     port = (server as unknown as { http: { address(): { port: number } } }).http.address().port;
@@ -86,296 +105,241 @@ describe("AppServer in demo mode", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("rejects an app socket with the wrong token", async () => {
-    await expect(openAppSocket(port, "wrong")).rejects.toBeTruthy();
+  const connected = async (): Promise<Client> => {
+    const c = await openClient(port);
+    await until(() => lastState(c)?.connection === "connected", 8000);
+    return c;
+  };
+
+  /**
+   * Tests share one server and one simulator, so anything that changes the
+   * robot's physical situation is reset here. Without this a test that leaves
+   * WALL-E at a table edge makes the next one fail depending on order.
+   */
+  beforeEach(() => {
+    server.mockRef?.setCliff(CLIFF.GROUND, 12);
   });
 
-  it("connects an app client and reports robot state", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => msgs.find((m) => m.type === "server_state"));
-    const state = msgs.find((m) => m.type === "server_state");
-    expect(state).toBeDefined();
-    if (state?.type !== "server_state") return;
-    expect(state.demoMode).toBe(true);
-    expect(state.target?.source).toBe("demo");
-    ws.close();
+  it("rejects an app socket with the wrong token", async () => {
+    await expect(openClient(port, "nope")).rejects.toBeTruthy();
   });
 
   it("reaches connected state against the simulated robot", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    const state = await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s && s.type === "server_state" && s.connection === "connected" ? s : undefined;
-    }, 6000);
-    expect(state).toBeDefined();
-    ws.close();
+    const c = await connected();
+    const s = lastState(c);
+    expect(s?.connection).toBe("connected");
+    expect(s?.demoMode).toBe(true);
+    expect(s?.target?.port).toBeGreaterThan(0);
+    c.close();
   });
 
-  it("sends a movement command and receives movement events", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected";
-    }, 6000);
-
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "move_forward",
-        requestId: "t-move-1",
-        payload: { duration: 200, speed: 0.5 },
-        timestamp: Date.now(),
-      }),
-    );
-
-    const started = await until(
-      () => msgs.find((m) => m.type === "activity" && m.entry.label === "movement_started"),
-      5000,
-    );
-    expect(started).toBeDefined();
-    if (started?.type !== "activity") return;
-    expect(started.entry.requestId).toBe("t-move-1");
-    ws.close();
+  it("has already learned the robot state by the time a client connects", async () => {
+    // The link sends HELLO on connect, so the state is known before any UI
+    // attaches and the status panel is populated on first paint.
+    const c = await connected();
+    const s = lastState(c);
+    expect(s?.status).not.toBeNull();
+    expect(s?.status?.stateCode).toBeGreaterThan(0);
+    c.close();
   });
 
-  it("stops movement on the stop command", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected";
-    }, 6000);
+  it("drives forward while held and stops on release", async () => {
+    const c = await connected();
+    c.send("drive", { command: CMD.MOVE_FORWARD, held: true });
+    expect(await until(() => hasActivity(c, "move_forward (held)"), 3000)).toBe(true);
+    expect(await until(() => lastState(c)?.driving === true, 3000)).toBe(true);
 
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "move_forward",
-        requestId: "t-move-2",
-        payload: { duration: 5000 },
-        timestamp: Date.now(),
-      }),
-    );
-    await until(() => msgs.find((m) => m.type === "activity" && m.entry.label === "movement_started"), 4000);
-
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "stop",
-        requestId: "t-stop-1",
-        payload: {},
-        timestamp: Date.now(),
-      }),
-    );
-    const stopped = await until(() => {
-      const stops = msgs.filter((m) => m.type === "activity" && m.entry.label === "movement_stopped");
-      return stops.find((s) => s.type === "activity" && s.entry.detail === "command");
-    }, 4000);
-    expect(stopped).toBeDefined();
-    ws.close();
+    c.send("stop", {});
+    expect(await until(() => hasActivity(c, "stop"), 3000)).toBe(true);
+    c.close();
   });
 
-  it("triggers a dance and reports the events", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected";
-    }, 6000);
+  it("sends an immediate stop command", async () => {
+    const c = await connected();
+    c.send("stop");
+    expect(await until(() => hasActivity(c, "stop"), 3000)).toBe(true);
+    c.close();
+  });
 
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "dance",
-        requestId: "t-dance-1",
-        payload: {},
-        timestamp: Date.now(),
-      }),
-    );
-    expect(await until(() => msgs.find((m) => m.type === "activity" && m.entry.label === "dance_started"), 4000)).toBeDefined();
-    expect(await until(() => msgs.find((m) => m.type === "activity" && m.entry.label === "dance_finished"), 6000)).toBeDefined();
-    ws.close();
+  it("runs a timed step move", async () => {
+    const c = await connected();
+    c.send("move_steps", { steps: 4 });
+    expect(await until(() => hasActivity(c, "move 4 steps"), 3000)).toBe(true);
+    c.close();
+  });
+
+  it("turns by degrees and turns around", async () => {
+    const c = await connected();
+    c.send("turn_degrees", { degrees: 90 });
+    expect(await until(() => hasActivity(c, "turn 90°"), 3000)).toBe(true);
+    c.send("turn_around", {});
+    expect(await until(() => hasActivity(c, "turn around"), 3000)).toBe(true);
+    c.close();
+  });
+
+  it("changes expression", async () => {
+    const c = await connected();
+    c.send("expression", { command: CMD.EXPR_HAPPY });
+    expect(await until(() => hasActivity(c, "expression_happy"), 3000)).toBe(true);
+    c.close();
+  });
+
+  it("dances", async () => {
+    const c = await connected();
+    c.send("simple", { command: CMD.DANCE });
+    expect(await until(() => lastState(c)?.status?.state === "dancing", 4000)).toBe(true);
+    expect(await until(() => lastState(c)?.status?.state === "idle", 8000)).toBe(true);
+    c.close();
   });
 
   it("toggles autonomous mode", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected";
-    }, 6000);
-
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "set_autonomous",
-        requestId: "t-auto-1",
-        payload: { enabled: true },
-        timestamp: Date.now(),
-      }),
-    );
-    const ev = await until(() => msgs.find((m) => m.type === "activity" && m.entry.label === "autonomous_changed"), 4000);
-    expect(ev).toBeDefined();
-
-    const state = await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.status?.autonomous === true ? s : undefined;
-    }, 4000);
-    expect(state).toBeDefined();
-    ws.close();
+    const c = await connected();
+    c.send("autonomous", { enabled: true });
+    expect(await until(() => lastState(c)?.status?.autonomous === true, 4000)).toBe(true);
+    c.send("autonomous", { enabled: false });
+    expect(await until(() => lastState(c)?.status?.autonomous === false, 4000)).toBe(true);
+    c.close();
   });
 
-  it("answers chat with an offline reply when no key is configured", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "ask",
-        requestId: "t-ask-1",
-        payload: { text: "Tell me a joke." },
-        timestamp: Date.now(),
-      }),
-    );
-    // `ask` is answered by the companion server, so it must not require a
-    // connected robot.
+  it("sends an ask and shows the reply in the activity feed", async () => {
+    const c = await connected();
+    c.send("ask", { text: "Tell me a joke." });
     const reply = await until(
-      () => msgs.find((m) => m.type === "activity" && m.entry.label === "WALL-E" && m.entry.detail),
-      5000,
+      () =>
+        c.msgs.find(
+          (m) => m.type === SERVER_MSG.ACTIVITY && m.entry.label === "WALL-E" && m.entry.detail,
+        ),
+      6000,
     );
     expect(reply).toBeDefined();
-    if (reply?.type !== "activity") return;
+    if (reply?.type !== SERVER_MSG.ACTIVITY) return;
     expect(reply.entry.detail).toMatch(/cross the road|Beep boop/i);
-    ws.close();
+    c.close();
   });
 
-  it("rejects an unknown command and does not forward it", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "self_destruct",
-        requestId: "t-bad-1",
-        payload: {},
-        timestamp: Date.now(),
-      }),
+  it("sends a verbatim speak command", async () => {
+    const c = await connected();
+    c.send("speak", { text: "battery low" });
+    const reply = await until(
+      () =>
+        c.msgs.find(
+          (m) =>
+            m.type === SERVER_MSG.ACTIVITY && m.entry.label === "WALL-E" && m.entry.detail === "battery low",
+        ),
+      6000,
     );
-    const err = await until(
-      () => msgs.find((m) => m.type === "activity" && m.entry.level === "error"),
-      3000,
-    );
-    expect(err).toBeDefined();
-    ws.close();
+    expect(reply).toBeDefined();
+    c.close();
   });
 
-  it("ignores a malformed client frame instead of crashing", async () => {
-    const { ws } = await openAppSocket(port);
-    expect(() => ws.send("{{{ not json")).not.toThrow();
+  it("reads the cliff sensor and reports ground distance", async () => {
+    const c = await connected();
+    c.send("read_sensor", {});
+    expect(await until(() => (lastState(c)?.status?.groundCm ?? 0) > 0, 4000)).toBe(true);
+    expect(lastState(c)?.status?.cliffName).toBe("ground");
+    c.close();
+  });
+
+  it("surfaces a cliff refusal and blocks movement", async () => {
+    const c = await connected();
+    server.mockRef!.setCliff(CLIFF.DROP, 44);
+    // Wording comes from the firmware's own error table.
+    expect(await until(() => (lastState(c)?.blocked ?? "").match(/edge/i), 5000)).toBeDefined();
+    c.send("drive", { command: CMD.MOVE_FORWARD, held: true });
+    expect(await until(() => hasActivity(c, /stopped at the edge/), 4000)).toBe(true);
+    // The block must clear on its own once the floor is back, otherwise the
+    // UI would keep refusing to drive after the robot is safe again.
+    server.mockRef!.setCliff(CLIFF.GROUND, 12);
+    expect(await until(() => lastState(c)?.blocked === null, 5000)).toBeDefined();
+    c.close();
+  });
+
+  it("republishes state when a block clears, not only when one appears", async () => {
+    // A stale "blocked" banner that never clears is worse than no banner:
+    // the operator would think WALL-E is broken.
+    const c = await connected();
+    server.mockRef!.setCliff(CLIFF.FAULT, 0);
+    expect(await until(() => /sensor/i.test(lastState(c)?.blocked ?? ""), 5000)).toBeDefined();
+
+    const before = c.msgs.length;
+    server.mockRef!.setCliff(CLIFF.GROUND, 12);
+    expect(await until(() => lastState(c)?.blocked === null, 5000)).toBeDefined();
+    // A state frame was pushed after the clear, with no command sent.
+    expect(c.msgs.length).toBeGreaterThan(before);
+    c.close();
+  });
+
+  it("rejects an unknown command", async () => {
+    const c = await openClient(port);
+    c.send("self_destruct", {});
+    expect(
+      await until(
+        () =>
+          c.msgs.some(
+            (m) => m.type === SERVER_MSG.ACTIVITY && /rejected/.test(m.entry.label ?? ""),
+          ),
+        3000,
+      ),
+    ).toBe(true);
+    c.close();
+  });
+
+  it("rejects a direction that is not a direction", async () => {
+    const c = await openClient(port);
+    c.send("drive", { command: CMD.DANCE, held: true });
+    expect(
+      await until(
+        () =>
+          c.msgs.some(
+            (m) => m.type === SERVER_MSG.ACTIVITY && /rejected/.test(m.entry.label ?? ""),
+          ),
+        3000,
+      ),
+    ).toBe(true);
+    c.close();
+  });
+
+  it("clamps an out-of-range step count rather than erroring", async () => {
+    const c = await connected();
+    c.send("move_steps", { steps: 9999 });
+    expect(await until(() => hasActivity(c, "move 50 steps"), 3000)).toBe(true);
+    c.close();
+  });
+
+  it("ignores a malformed app frame instead of crashing", async () => {
+    const c = await connected();
+    expect(() => c.ws.send("{{{ not json")).not.toThrow();
     await new Promise((r) => setTimeout(r, 200));
-    ws.send(
-      JSON.stringify({
-        type: "command",
-        v: 1,
-        command: "ping",
-        requestId: "t-after-junk",
-        payload: {},
-        timestamp: Date.now(),
-      }),
-    );
-    expect(ws.readyState).toBe(WebSocket.OPEN);
-    ws.close();
+    c.send("ping", {});
+    expect(c.ws.readyState).toBe(WebSocket.OPEN);
+    c.close();
   });
 
   it("reconnects after the robot goes away", async () => {
-    const { ws, msgs } = await openAppSocket(port);
-    await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected";
-    }, 6000);
-
-    // Kill the simulated robot out from under the link.
+    const c = await connected();
     await server.stopDemoMode();
-    const offline = await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "disconnected" ? s : undefined;
-    }, 5000);
-    expect(offline).toBeDefined();
+    expect(await until(() => lastState(c)?.connection === "disconnected", 5000)).toBeDefined();
 
     await server.startDemoMode();
-    const back = await until(() => {
-      const s = [...msgs].reverse().find((m) => m.type === "server_state");
-      return s?.type === "server_state" && s.connection === "connected" ? s : undefined;
-    }, 8000);
-    expect(back).toBeDefined();
-    ws.close();
-  });
-});
-
-describe("API key isolation", () => {
-  let server: ReturnType<typeof createAppServer>;
-  let base: string;
-  let tmp: string;
-
-  beforeAll(async () => {
-    tmp = mkdtempSync(join(tmpdir(), "walle-key-"));
-    server = createAppServer(testConfig({ geminiApiKey: GEMINI_KEY_SENTINEL }));
-    (server as unknown as { settings: SettingsStore }).settings = new SettingsStore(join(tmp, "settings.json"));
-    await server.start();
-    await server.startDemoMode();
-    const port = (server as unknown as { http: { address(): { port: number } } }).http.address().port;
-    base = `http://127.0.0.1:${port}`;
-  });
-
-  afterAll(async () => {
-    await server.stop();
-    rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("keeps the Gemini key out of every app-facing payload", async () => {
-    const { ws, msgs } = await openAppSocket(Number(new URL(base).port));
-
-    for (const cmd of [
-      { command: "ask", payload: { text: "Tell me a joke." } },
-      { command: "get_status", payload: {} },
-      { command: "set_autonomous", payload: { enabled: true } },
-      { command: "dance", payload: {} },
-    ]) {
-      ws.send(
-        JSON.stringify({
-          type: "command",
-          v: 1,
-          ...cmd,
-          requestId: `k-${cmd.command}`,
-          timestamp: Date.now(),
-        }),
-      );
-    }
-    await new Promise((r) => setTimeout(r, 1200));
-    expect(JSON.stringify(msgs)).not.toContain(GEMINI_KEY_SENTINEL);
-
-    for (const path of ["/api/state", "/api/settings", "/api/config", "/api/activity", "/api/health"]) {
-      const text = await (await fetch(`${base}${path}`)).text();
-      expect(text, `leak in ${path}`).not.toContain(GEMINI_KEY_SENTINEL);
-    }
-    ws.close();
+    expect(await until(() => lastState(c)?.connection === "connected", 10000)).toBeDefined();
+    c.close();
   });
 });
 
 describe("AppServer HTTP surface", () => {
-  let server: ReturnType<typeof createAppServer>;
+  let server: AppServer;
   let base: string;
   let tmp: string;
 
   beforeAll(async () => {
     tmp = mkdtempSync(join(tmpdir(), "walle-http-"));
     server = createAppServer(testConfig());
-    (server as unknown as { settings: SettingsStore }).settings = new SettingsStore(join(tmp, "settings.json"));
+    (server as unknown as { settings: SettingsStore }).settings = new SettingsStore(
+      join(tmp, "settings.json"),
+    );
     await server.start();
-    const port = (server as unknown as { http: { address(): { port: number } } }).http.address().port;
-    base = `http://127.0.0.1:${port}`;
+    const p = (server as unknown as { http: { address(): { port: number } } }).http.address().port;
+    base = `http://127.0.0.1:${p}`;
   });
 
   afterAll(async () => {
@@ -385,7 +349,6 @@ describe("AppServer HTTP surface", () => {
 
   it("reports health", async () => {
     const res = await fetch(`${base}/api/health`);
-    expect(res.ok).toBe(true);
     expect(await res.json()).toMatchObject({ ok: true });
   });
 
@@ -402,48 +365,54 @@ describe("AppServer HTTP surface", () => {
 
   it("accepts a WebSocket upgrade carrying the issued token", async () => {
     const { token } = (await (await fetch(`${base}/api/session`)).json()) as { token: string };
-    const { ws } = await openAppSocket(Number(new URL(base).port), token);
-    expect(ws.readyState).toBe(WebSocket.OPEN);
-    ws.close();
+    const c = await openClient(Number(new URL(base).port), token);
+    expect(c.ws.readyState).toBe(WebSocket.OPEN);
+    c.close();
   });
 
-  it("returns settings and never exposes a key", async () => {
-    const res = await fetch(`${base}/api/settings`);
-    const body = await res.json();
+  it("returns settings and exposes no secrets", async () => {
+    const body = (await (await fetch(`${base}/api/settings`)).json()) as Record<string, unknown>;
     expect(body.robotName).toBe("WALL-E");
-    expect(body.geminiApiKey).toBeUndefined();
-    expect(body.geminiConfigured).toBe(false);
+    expect(Object.keys(body).join(",")).not.toMatch(/key|secret|token/i);
   });
 
-  it("saves settings and clamps out-of-range values", async () => {
+  it("saves settings and clamps them", async () => {
     const res = await fetch(`${base}/api/settings`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ motorSpeed: 5, robotName: "  WALLE  " }),
+      body: JSON.stringify({ stepCount: 9999, sensorPollMs: 5, robotName: "  WALLE  " }),
     });
-    const body = await res.json();
-    expect(body.motorSpeed).toBe(1);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.stepCount).toBe(50);
+    expect(body.sensorPollMs).toBe(100);
     expect(body.robotName).toBe("WALLE");
+  });
+
+  it("allows disabling sensor polling", async () => {
+    const res = await fetch(`${base}/api/settings`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sensorPollMs: 0 }),
+    });
+    expect(((await res.json()) as { sensorPollMs: number }).sensorPollMs).toBe(0);
   });
 
   it("rejects a connect request with no host", async () => {
     const res = await fetch(`${base}/api/connect`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
+      body: "{}",
     });
     expect(res.status).toBe(400);
   });
 
-  it("reports no robots when discovery is disabled", async () => {
-    const res = await fetch(`${base}/api/discover`);
-    const body = await res.json();
-    expect(body.robots).toEqual([]);
+  it("explains that the robot does not advertise itself", async () => {
+    const body = (await (await fetch(`${base}/api/scan`)).json()) as { note: string };
+    expect(body.note).toMatch(/serial log/i);
   });
 
   it("exposes activity history", async () => {
-    const res = await fetch(`${base}/api/activity`);
-    const body = await res.json();
+    const body = (await (await fetch(`${base}/api/activity`)).json()) as { entries: unknown[] };
     expect(Array.isArray(body.entries)).toBe(true);
   });
 });
@@ -457,8 +426,8 @@ describe("SettingsStore", () => {
   it("round-trips an update through disk", () => {
     const dir = mkdtempSync(join(tmpdir(), "walle-s-"));
     const file = join(dir, "settings.json");
-    new SettingsStore(file).update({ robotName: "WALL-E", motorSpeed: 0.9 });
-    expect(new SettingsStore(file).get().motorSpeed).toBe(0.9);
+    new SettingsStore(file).update({ robotName: "WALL-E", stepCount: 9 });
+    expect(new SettingsStore(file).get().stepCount).toBe(9);
   });
 
   it("survives a corrupt file", () => {

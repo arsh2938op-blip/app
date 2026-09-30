@@ -1,12 +1,15 @@
 # WALL-E — Companion App
 
-Control centre for the WALL-E Innovation Day robot (ESP32-C3 + camera, OLED,
-microphone, speaker, 4 motors, Gemini AI, STT, TTS).
+Control centre for the WALL-E Innovation Day robot: an ESP32-S3 with a
+distance sensor, OLED, motors, speaker and its own Gemini pipeline.
 
-> **This repository is the APP only.** The ESP32 firmware lives in a separate
-> repository. The two meet through a documented contract:
-> **[WALL-E Robot API v1](docs/WALL-E_ROBOT_API.md)**. Nothing here modifies or
-> depends on firmware internals.
+The app is a **second controller**. It speaks the same 10-byte binary packets
+as the handheld radio remote, over TCP instead of ESP-NOW, and the robot
+funnels both through one dispatcher.
+
+> **This repository is the APP only.** The firmware lives in a separate
+> repository and is not modified from here. The two meet through a documented
+> contract: **[WALL-E Robot API](docs/WALL-E_ROBOT_API.md)**.
 
 ---
 
@@ -15,26 +18,41 @@ microphone, speaker, 4 motors, Gemini AI, STT, TTS).
 ```bash
 npm install
 
-# Terminal 1 — companion server (discovery, command broker, Gemini proxy)
-npm run dev:server
-
-# Terminal 2 — UI
-npm run dev:client
+npm run dev:server   # companion server, port 8787
+npm run dev:client   # UI, port 5173
 ```
 
-Open <http://localhost:5173> and press **Demo Mode** to drive the simulated
-robot. No hardware needed.
+Open <http://localhost:5173>, then press **Demo mode** to drive a simulated
+robot with no hardware.
 
-To run against the real robot: both the laptop and the ESP32 must be on the
-same Wi-Fi. Press **Scan for WALL-E** (or enter the IP manually and press
-**Connect**).
+### Against the real robot
 
-### Production build
+1. The robot's IP is **printed on its serial log at boot**. There is no
+   discovery — the firmware has no mDNS.
+2. Laptop and robot on the same Wi-Fi.
+3. **Connect** tab → enter the IP → **Connect**.
+
+The address is remembered, so a demo needs it typed once.
+
+---
+
+## Android
 
 ```bash
-npm run build   # typecheck + bundle the client
-npm start       # serves API, WebSocket and the built UI on :8787
+npm run android:apk
 ```
+
+Produces `android/app/build/outputs/apk/debug/app-debug.apk`. Install with
+`adb install -d <path>`, or copy the file to the phone and open it (enable
+*install from unknown sources*).
+
+The phone still needs the companion server running on the laptop — the app is
+a web UI in a native shell, and the server is what speaks TCP to the robot.
+To use the phone on its own, run the server on something always-on and point
+the app at it.
+
+**See [docs/ANDROID.md](docs/ANDROID.md)** for the toolchain setup, cleartext
+networking, and release signing.
 
 ---
 
@@ -42,129 +60,94 @@ npm start       # serves API, WebSocket and the built UI on :8787
 
 ```
 src/
-  shared/        protocol + validation, imported by BOTH sides
-    protocol.ts        ← single source of truth for commands, events, messages
-    validate.ts        ← validates every inbound robot message
-    validateCommand.ts ← allowlist + range checks on every outbound command
+  shared/
+    walleProtocol.ts     byte-exact mirror of shared/walle_protocol.h
+    walleTypes.ts        app-side JSON types and normalised robot state
+    validateAppCommand.ts  allowlist + clamping for every outbound command
   server/
-    index.ts           entry point
-    appServer.ts       broker: HTTP API, app WebSocket, command routing
-    config.ts          env/.env config; the only place secrets are read
-    discovery.ts       mDNS browse for _walle._tcp.local
+    index.ts
+    appServer.ts         broker: HTTP, app WebSocket, command routing
+    config.ts
     connection/
-      robotLink.ts     WebSocket to the ESP32: reconnect, requestId
-                       correlation, timeouts, inbound validation
-    services/
-      gemini.ts        server-side Gemini calls + offline fallback
+      robotLink.ts       TCP to the ESP32: framing, keepalive, reconnect
     storage/
-      settingsStore.ts persisted settings (.walle/settings.json)
+      settingsStore.ts   remembers the robot's IP
   client/
-    App.tsx            three tabs: control / connect / settings
-    store.ts           app socket, state, optimistic activity
-    ui/                controls, chat, camera, settings, activity
+    App.tsx              drive / connect / settings
+    store.ts             app socket, state, commands
+    keepAwake.ts         screen wake lock (a safety requirement)
+    ui/
+      Joystick.tsx       8-way virtual joystick
+      controls.tsx       drive, timed moves, modes, expressions, voice
+      chat.tsx           ask WALL-E, activity feed
+      settings.tsx       robot status, connection, settings
   mock/
-    mockRobot.ts       reference implementation of Robot API v1
-tests/                 83 tests over the protocol, link and server
-docs/WALL-E_ROBOT_API.md
+    mockRobot.ts         simulator speaking the real protocol over real TCP
+tests/                   132 tests
 ```
 
-### Why a Node server in the middle?
+### Why a server in the middle
 
-The browser cannot do three of the things this app needs:
-
-1. **mDNS discovery** — a browser has no access to multicast.
-2. **Hiding the Gemini key** — a key in frontend code is a published key.
-3. **Validating the robot's messages** — one chokepoint, one audit point.
-
-So the app is a browser UI + a local Node companion server. The server is the
-only thing that talks to the ESP32. This is also what keeps the connection layer
-light enough for an ESP32-C3: a single WebSocket carrying small JSON frames.
+A browser cannot open a raw TCP socket, and the robot speaks binary over TCP.
+So the server does the framing, and the UI speaks ordinary JSON over a
+WebSocket. It is also the only place that can hold the 700 ms safety watchdog
+consistently, and one validation chokepoint for everything reaching the robot.
 
 ---
 
-## Features
+## Controls
 
-| Area | What it does |
-|---|---|
-| Connection | mDNS scan, manual IP, last-known address, connect/disconnect |
-| Status | name, firmware, IP, Wi-Fi RSSI, state, expression, mode, heap, battery (only if reported) |
-| Movement | D-pad, rotate L/R, instant STOP, releases send `stop` in manual mode |
-| Expressions | 7 test expressions with live face preview |
-| Modes | Dance, Explore, Autonomous Mode toggle, Idle |
-| Chat | Ask WALL-E, see the STT → Gemini → TTS chain in the activity feed |
-| Camera | Stream URL if the firmware offers one, else JPEG frames, else a clear placeholder |
-| Activity | Compact event log with a low-level toggle |
-| Settings | name, connection method, motor speed, volume, auto-reconnect, Gemini key |
-| Offline | "WALL-E offline" banner, backoff reconnect, timeouts surfaced as errors |
-| Demo mode | Full simulated robot, clearly labelled |
+**Joystick — 8-way, digital.** Push forward to drive, sideways to arc, back to
+reverse, hard left/right to pivot. Pressing a direction arms the keepalive;
+lifting sends `STOP` immediately. There is no analogue speed: the robot's
+contract is a set of intents, and on stage a predictable direction beats a
+half-press.
 
----
+**Timed moves** — `move_steps`, `turn_degrees` and `turn_around` finish by
+themselves, so no keepalive and no stop afterwards.
 
-## Demo mode
+**Ask** — type a question. The robot's own Gemini answers and speaks out loud;
+the answer comes back as a text frame. There is no microphone: the robot has
+none, and the app adds none.
 
-Demo mode is a **real WebSocket server implementing Robot API v1**, started
-in-process by the companion server. The app code path is identical — the same
-`RobotLink`, the same validation, the same protocol — so a green demo also
-exercises the real integration.
-
-It is always labelled with a **DEMO MODE** banner so it is never confused with
-the physical robot.
-
-```bash
-# In-process, via the UI toggle
-npm run mock              # standalone, for testing the real app against it
-MOCK_ADVERTISE=1 npm run mock   # also advertises over mDNS
-WALLE_DEMO=1 npm run dev:server  # start the whole app in demo mode
-```
-
-The mock simulates: connection, movement, expressions, STT, Gemini, TTS, dance,
-explore, autonomous mode, camera-ready, and status updates.
+**Demo mode** — a real TCP simulator running the real protocol, so a green
+demo also exercises the real integration. Always labelled.
 
 ---
 
-## Security
+## Safety
 
-- The Gemini key is read only by the server (`src/server/config.ts`) and is
-  never bundled into the client or sent to the ESP32. A test asserts it never
-  appears in any app-facing payload or HTTP response.
-- Every inbound robot frame is parsed and validated before reaching the UI.
-  Malformed JSON, oversized frames, unknown events and newer protocol versions
-  are dropped and reported.
-- Every outbound command passes an allowlist and range check. The app will not
-  forward a command it did not construct itself.
-- Inbound `command` frames from the robot are ignored — the robot cannot drive
-  the app.
-- The app WebSocket requires a token; the robot WebSocket supports an optional
-  `Authorization: Bearer` secret.
-- Commands are rate limited server-side.
+These are the robot's rules, surfaced rather than bypassed:
+
+- The robot stops itself if the app goes quiet for **700 ms** while driving.
+  The app re-sends the held command every 250 ms and holds a screen wake lock,
+  because a locked screen is a silent app.
+- A cliff or a dead sensor **stops the robot and is not retried**. The status
+  panel shows the ground distance in centimetres.
+- WALL-E **will not move while thinking or speaking**. The app shows why
+  instead of retrying.
+- The handheld remote and the app can never both own the wheels.
+- Every outbound command is allowlisted and every argument clamped before it
+  is forwarded.
 
 ---
 
 ## Testing
 
 ```bash
-npm test        # 83 tests
-npm run typecheck
+npm test        # 132 tests
+npm run build   # typecheck + bundle
 ```
 
-Coverage against the brief's checklist:
-
-| # | Requirement | Where |
-|---|---|---|
-| 1 | App starts | `npm run dev` — companion server + Vite |
-| 2 | Demo mode works | `appServer.test.ts` — full suite runs in demo mode |
-| 3 | Discovery works | `discovery.test.ts` — mDNS publish/browse (skippable via `WALLE_TEST_MDNS=0`) |
-| 4 | Manual IP connection | `appServer.test.ts` — `/api/connect`, plus `discovery.test.ts` |
-| 5 | Connection status updates | `appServer.test.ts` — connected / offline / reconnected |
-| 6 | Movement commands sent | `robotLink.test.ts` — `movement_started` with matching `requestId` |
-| 7 | Stop works | `robotLink.test.ts` + `appServer.test.ts` — `movement_stopped` reason `command` |
-| 8 | Expression commands | `robotLink.test.ts` — `expression_changed` |
-| 9 | Dance command | `robotLink.test.ts` + `appServer.test.ts` — start and finish |
-| 10 | Autonomous toggle | `robotLink.test.ts` + `appServer.test.ts` — `autonomous_changed` + status |
-| 11 | Chat messages | `appServer.test.ts` — offline reply through the server path |
-| 12 | Events appear | `appServer.test.ts` — activity stream assertions |
-| 13 | Disconnect/reconnect | `appServer.test.ts` — robot killed and restarted |
-| 14 | Invalid messages handled | `protocol.test.ts` + `robotLink.test.ts` — 15 hostile-input cases |
+| Area | Covered in |
+|---|---|
+| Every protocol constant vs the firmware header | `walleProtocol.test.ts` |
+| Packet encode/decode, text frames, stream framing, garbage recovery | `walleProtocol.test.ts` |
+| Command validation and clamping | `walleProtocol.test.ts` |
+| Real TCP against the simulator: drive, stop, keepalive, watchdog, cliff, voice | `robotLink.test.ts` |
+| Hostile stream: resync, bad magic, inbound command frames, 64 KB chunk, byte-by-byte text | `robotLink.test.ts` |
+| Server end-to-end in demo mode | `appServer.test.ts` |
+| Joystick dead zone, 8-way resolution, command mapping | `joystick.test.ts` |
 
 ---
 
@@ -172,40 +155,19 @@ Coverage against the brief's checklist:
 
 Copy `.env.example` to `.env`. Everything is optional.
 
-| Variable | Default | Purpose |
+| Variable | Default | |
 |---|---|---|
-| `PORT` | `8787` | Companion server port |
-| `WALLE_APP_TOKEN` | random per boot | Token the browser must present |
-| `WALLE_ROBOT_TOKEN` | — | Shared secret the ESP32 requires |
-| `GEMINI_API_KEY` | — | Server-side only; offline replies without it |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | |
-| `WALLE_ROBOT_HOST` | — | Auto-connect target at startup |
-| `WALLE_DEMO` | `0` | Start in demo mode |
-| `WALLE_DISCOVERY` | `1` | Enable mDNS |
-| `WALLE_RECONNECT` | `1` | Auto-reconnect on drop |
-| `WALLE_RATE_MAX` | `25` | Commands per second per client |
+| `PORT` | `8787` | companion server port |
+| `WALLE_ROBOT_HOST` | — | connect to this robot on startup |
+| `WALLE_ROBOT_PORT` | `8080` | must match `APP_TCP_PORT` |
+| `WALLE_DEMO` | `0` | start in demo mode |
+| `WALLE_RECONNECT` | `1` | retry with backoff |
+| `WALLE_APP_TOKEN` | random per boot | app WebSocket token |
 
 Settings edited in the UI persist to `.walle/settings.json`.
 
----
-
-## How the ESP32 should connect
-
-Full details in [`docs/WALL-E_ROBOT_API.md`](docs/WALL-E_ROBOT_API.md). In short:
-
-1. Run a **WebSocket server on port 8080**.
-2. On connect, send `robot_ready` with a full `RobotStatus`.
-3. Advertise mDNS `_walle._tcp.local.` with TXT `name`, `fw`, `model`.
-4. Accept `Authorization: Bearer <token>` if a secret is configured.
-5. Parse each frame; reply with exactly one `response` carrying the same
-   `requestId`.
-6. Emit events for every state change, and `status` after any status update.
-7. Implement the camera path — **JPEG `camera_frame` events are recommended**
-   over streaming for an ESP32-C3.
-8. Omit `battery` unless a real sensor exists.
-9. **Work standalone.** The app is optional; the robot must run on its own.
-
-A per-firmware implementation checklist is in §10 of the API document.
+There is **no API key anywhere**. The robot holds its own Gemini key and runs
+its own speech pipeline; the app only sends `ask` and displays the answer.
 
 ---
 
@@ -213,13 +175,13 @@ A per-firmware implementation checklist is in §10 of the API document.
 
 Blocked on the physical robot, not on the app:
 
-- **Camera transport.** The app supports both stream-URL and JPEG-frame modes,
-  but which one is used depends on firmware. JPEG frames are the low-risk path
-  for a C3; expect to tune resolution and frame rate.
-- **Battery display.** Hidden until the firmware reports a real sensor.
-- **Microphone latency.** The app shows STT events as they arrive; the actual
-  capture quality is a firmware concern.
-- **Motor feel.** Speed/duration values in the app map to whatever the
-  firmware's `set_motor_speed` accepts. PID tuning is firmware-side.
-- **mDNS on Windows.** Often blocked. The manual IP path is fully supported and
-  the address is remembered, so this is a fallback rather than a blocker.
+- **End-to-end validation.** The protocol is verified against a simulator that
+  implements the same header, not against silicon.
+- **Sensor poll rate.** The app defaults to 5 Hz, the integration doc's
+  ceiling. On the real ultrasonic sensor this may need to be slower.
+- **Step distance.** `STEP_DISTANCE_CM` is a config constant; with no wheel
+  encoders, "4 steps" is a timed estimate until it is measured.
+- **Drive feel.** Motor speed, turn duration (`MANEUVER_MS_PER_TURN_360`) and
+  PID are firmware-side. The app sends intents only and cannot compensate.
+- **The 700 ms watchdog on a bad network.** 250 ms re-sends have margin, but a
+  genuinely congested Wi-Fi is untested.

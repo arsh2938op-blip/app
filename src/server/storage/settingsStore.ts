@@ -1,35 +1,37 @@
 /**
- * Persistent settings + last-known robot address.
+ * Persistent settings + the robot's last known address.
  *
- * Deliberately a plain JSON file rather than SQLite: it holds no secrets,
- * is trivially inspectable before a demo, and keeps the server dependency-light.
+ * The robot's IP is printed on its serial log at boot and never changes
+ * unless the network does, so remembering it is the difference between
+ * tapping once and typing an IP on stage.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { DEFAULT_ROBOT_PORT } from "../../shared/walleProtocol.js";
 
 export interface StoredSettings {
   robotName: string;
   host: string | null;
   port: number;
-  connectionMethod: "mdns" | "manual" | "demo";
   autoReconnect: boolean;
-  motorSpeed: number;
-  volume: number;
+  /** Which step count the timed-motion button sends by default. */
+  stepCount: number;
+  /** How often the UI polls the cliff sensor, in ms. 0 disables polling. */
+  sensorPollMs: number;
   demoMode: boolean;
-  cameraEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: StoredSettings = {
   robotName: "WALL-E",
   host: null,
-  port: 8080,
-  connectionMethod: "mdns",
+  port: DEFAULT_ROBOT_PORT,
   autoReconnect: true,
-  motorSpeed: 0.6,
-  volume: 0.7,
+  stepCount: 4,
+  // 5 Hz is the integration doc's ceiling: every poll is a real ultrasonic
+  // echo, so polling faster wastes the sensor without adding information.
+  sensorPollMs: 200,
   demoMode: false,
-  cameraEnabled: false,
 };
 
 export class SettingsStore {

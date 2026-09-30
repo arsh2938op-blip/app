@@ -1,12 +1,19 @@
-import { useState } from "react";
-import { useStore } from "./store.js";
+import { useEffect, useState } from "react";
+import { useStore, loadSettings } from "./store.js";
 import { useToast } from "./ui/common.js";
-import { RobotInfoPanel, ConnectionPanel, SettingsPanel } from "./ui/settings.js";
-import { MovementPanel, ExpressionPanel, ModesPanel } from "./ui/controls.js";
-import { ChatPanel, ActivityPanel } from "./ui/chat.js";
-import { CameraPanel } from "./ui/camera.js";
+import { acquireWakeLock } from "./keepAwake.js";
+import { ConnectionPanel, RobotInfoPanel, SettingsPanel } from "./ui/settings.js";
+import {
+  DrivePanel,
+  ExpressionPanel,
+  ModesPanel,
+  TimedMotionPanel,
+  VoiceQuickPanel,
+} from "./ui/controls.js";
+import { ActivityPanel, ChatPanel } from "./ui/chat.js";
+import { ROBOT_STATE } from "../shared/walleProtocol.js";
 
-type Tab = "control" | "connect" | "settings";
+type Tab = "drive" | "connect" | "settings";
 
 const CONNECTION_LABEL: Record<string, string> = {
   disconnected: "Disconnected",
@@ -16,6 +23,14 @@ const CONNECTION_LABEL: Record<string, string> = {
   error: "Error",
 };
 
+/** Short label for the robot's current state, as the firmware names it. */
+function stateLabel(code: number, name: string): string {
+  if (code === ROBOT_STATE.THINKING) return "Thinking…";
+  if (code === ROBOT_STATE.SPEAKING) return "Speaking…";
+  if (code === ROBOT_STATE.REMOTE) return "Driving";
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
 export function App() {
   const connection = useStore((s) => s.connection);
   const demoMode = useStore((s) => s.demoMode);
@@ -23,10 +38,22 @@ export function App() {
   const status = useStore((s) => s.status);
   const target = useStore((s) => s.target);
   const lastError = useStore((s) => s.lastError);
-  const [tab, setTab] = useState<Tab>("control");
+  const [tab, setTab] = useState<Tab>("drive");
   const [toast, notify] = useToast();
 
-  const offline = connection === "disconnected";
+  // Settings are needed by the step-count slider on first render.
+  useEffect(() => {
+    void loadSettings();
+  }, []);
+
+  // A locked screen would make the app go quiet and the robot would stop
+  // itself mid-manoeuvre, so keep the display awake while this is visible.
+  useEffect(() => {
+    void acquireWakeLock();
+  }, []);
+
+  const offline = connection !== "connected";
+  const state = status?.state ?? "boot";
 
   return (
     <div className="app">
@@ -38,8 +65,7 @@ export function App() {
           <div>
             <h1>{robotName}</h1>
             <div className="hint">
-              {target ? `${target.host}:${target.port}` : "no target"} · fw{" "}
-              {status?.firmwareVersion ?? "—"}
+              {target ? `${target.host}:${target.port}` : "no robot"} · TCP
             </div>
           </div>
         </div>
@@ -47,21 +73,23 @@ export function App() {
         <div className="conn">
           <span className={`dot ${connection}`} />
           <span>
-            {demoMode && connection !== "connected" ? "Demo — " : ""}
+            {demoMode && offline ? "Demo — " : ""}
             {CONNECTION_LABEL[connection] ?? connection}
           </span>
         </div>
 
+        <div className={`pill state-pill ${state}`}>{stateLabel(status?.stateCode ?? 0, state)}</div>
+
         <nav className="tabs" role="tablist">
-          {(["control", "connect", "settings"] as const).map((t) => (
+          {(["drive", "connect", "settings"] as const).map((t) => (
             <button
               key={t}
               role="tab"
               aria-selected={tab === t}
               onClick={() => setTab(t)}
-              style={{ textTransform: "capitalize" }}
+              className={tab === t ? "selected" : ""}
             >
-              {t}
+              {t.charAt(0).toUpperCase() + t.slice(1)}
             </button>
           ))}
         </nav>
@@ -70,23 +98,24 @@ export function App() {
       {demoMode ? <div className="demo-banner">DEMO MODE — simulated robot, no hardware</div> : null}
 
       {offline && lastError ? (
-        <div className="demo-banner" style={{ background: "rgb(229 72 77 / 0.12)", borderColor: "#5c2a2d", color: "#ff9a9e" }}>
+        <div className="demo-banner offline">
           WALL-E offline — {lastError.message}
           {tab !== "connect" ? (
             <button className="ghost" style={{ marginLeft: 10 }} onClick={() => setTab("connect")}>
-              Reconnect
+              Connect
             </button>
           ) : null}
         </div>
       ) : null}
 
-      {tab === "control" ? (
+      {tab === "drive" ? (
         <main className="grid">
-          <CameraPanel />
+          <DrivePanel />
+          <TimedMotionPanel />
           <RobotInfoPanel />
-          <MovementPanel />
           <ModesPanel />
           <ExpressionPanel />
+          <VoiceQuickPanel />
           <ChatPanel />
           <ActivityPanel />
         </main>
