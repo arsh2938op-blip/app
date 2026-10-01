@@ -1,0 +1,135 @@
+# Builds the Android APK on GitHub's own runners.
+#
+# The point is that nobody needs Node, Android Studio or a JDK installed to
+# produce the installer. Push a tag and the APK appears on the Releases page,
+# ready to download and install on a phone.
+#
+# On a normal push to master it only verifies that the project still builds
+# and the tests still pass, without spending the extra minutes on packaging.
+
+name: Android APK
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  apk:
+    name: Build APK
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          # Capacitor's generated project pins AGP 8.2, which does not run on
+          # newer JDKs. 17 is the version it is tested against.
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - run: npm ci
+
+      # The SDK path must come from the environment. On Windows the Android
+      # Gradle Plugin mis-parses android/local.properties and dies with
+      # "The filename, directory name, or volume label syntax is incorrect";
+      # using ANDROID_HOME avoids that entirely.
+      - name: Build the debug APK
+        run: npm run android:apk
+
+      - name: Give the APK a versioned name
+        run: |
+          mv android/app/build/outputs/apk/debug/app-debug.apk \
+             "walle-vulkan-${GITHUB_REF_NAME}.apk"
+          ls -la walle-vulkan-*.apk
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: walle-vulkan-apk
+          path: "walle-vulkan-*.apk"
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Attach APK to the Release
+    needs: apk
+    # Only tags become releases. A plain push still gets a downloadable
+    # artifact on the Actions page, just not a public release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: walle-vulkan-apk
+
+      - name: Create the release and upload the APK
+        uses: softprops/action-gh-release@v2
+        with:
+          files: walle-vulkan-*.apk
+          generate_release_notes: true
+          body: |
+            ## Installing on a phone
+
+            1. Download the APK below to the phone (or open this page on the phone).
+            2. Tap it. Android will warn that the file came from outside the Play
+               Store — that is expected for a debug build, so choose
+               **Settings → Allow from this source**, or **Install anyway**.
+            3. Open Vulkan, go to the **Connect** tab, and enter the IP address the
+               robot printed on its serial log at boot.
+
+            No computer, no Node, no server: the app opens the robot's TCP
+            connection itself. The phone and the robot need to be on the same
+            Wi-Fi.
+
+            ## What you get
+
+            * 8-way joystick driving, with `stop` on release
+            * Timed moves: steps, degrees, turn around
+            * Dance, explore, autonomous mode, five expressions
+            * Cliff-sensor readout with the robot's own refusal messages
+            * Chat by typing or by microphone, answered in Vulkan's voice and
+              spoken through the robot's amplifier
+
+            ## Note on the persona
+
+            The app sends `set_persona` (0x1d) on connect. Until the firmware
+            implements it, Vulkan answers in whatever voice is compiled in — the
+            app still sends the frame, and the prompt is documented in
+            `docs/WALL-E_ROBOT_API.md` §11.
