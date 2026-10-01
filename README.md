@@ -28,6 +28,17 @@ different socket underneath.
 
 ---
 
+## Installing on a phone
+
+**No Node, no Android Studio, no JDK.** Download the APK from
+[Releases](https://github.com/arsh2938op-blip/app/releases), allow the
+unknown-source install, and enter the robot's IP.
+
+Full steps in **[docs/INSTALL.md](docs/INSTALL.md)**. The APK is rebuilt and
+republished automatically whenever a `v*` tag is pushed.
+
+---
+
 ## Quick start
 
 ### On a phone
