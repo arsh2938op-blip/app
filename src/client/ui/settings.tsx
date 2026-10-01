@@ -1,6 +1,15 @@
 import { useEffect, useState } from "react";
 import { DEFAULT_ROBOT_PORT, ROBOT_STATE } from "../../shared/walleProtocol.js";
-import { api, readSensor, useStore } from "../store.js";
+import { ROBOT_NAME } from "../../shared/persona.js";
+import {
+  api,
+  connectDirect,
+  disconnectDirect,
+  isDirectLink,
+  readSensor,
+  useStore,
+} from "../store.js";
+import { linkModeLabel } from "../nativeLink.js";
 import { timeOf } from "./common.js";
 
 const CONNECTION_LABEL: Record<string, string> = {
@@ -62,14 +71,14 @@ export function RobotInfoPanel() {
 
       {status?.wheelsBlocked ? (
         <div className="notice warn">
-          WALL-E is {status.state}. It will not move while it is thinking or speaking.
+           is {status.state}. It will not move while it is thinking or speaking.
         </div>
       ) : null}
       {cliff === "drop" || cliff === "fault" ? (
         <div className="notice err">
           {cliff === "drop"
-            ? "No floor detected — WALL-E has stopped."
-            : "Distance sensor is not responding — WALL-E has stopped."}
+            ? "No floor detected — the robot has stopped."
+            : "Distance sensor is not responding — the robot has stopped."}
         </div>
       ) : null}
       {demoMode ? null : null}
@@ -89,6 +98,7 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
   const demoMode = useStore((s) => s.demoMode);
   const target = useStore((s) => s.target);
   const status = useStore((s) => s.status);
+  const direct = isDirectLink();
   const [host, setHost] = useState("");
   const [port, setPort] = useState(DEFAULT_ROBOT_PORT);
 
@@ -103,9 +113,18 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
   }, []);
 
   const connect = async () => {
-    if (!host.trim()) return notify("Enter the IP from WALL-E's serial log", "err");
+    if (!host.trim()) return notify("Enter the IP from the robot's serial log", "err");
+    const p = Number(port) || DEFAULT_ROBOT_PORT;
+    // On the phone there is no companion server to ask, so the socket is
+    // opened here and the address is only remembered for next launch.
+    if (direct) {
+      connectDirect(host.trim(), p);
+      void api.saveSettings({ host: host.trim(), port: p }).catch(() => {});
+      notify("Connecting straight to the robot…");
+      return;
+    }
     try {
-      await api.connect(host.trim(), Number(port) || DEFAULT_ROBOT_PORT);
+      await api.connect(host.trim(), p);
       notify("Connecting…");
     } catch (err) {
       notify((err as Error).message, "err");
@@ -113,6 +132,9 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
   };
 
   const toggleDemo = async () => {
+    // Demo mode is the companion server's simulator; there is nothing to
+    // simulate from on a phone that is talking to the robot directly.
+    if (direct) return notify("Demo mode is for the desktop server");
     try {
       const { demoMode: now } = await api.demo(!demoMode);
       notify(now ? "Demo mode ON — simulated robot" : "Demo mode OFF");
@@ -126,8 +148,14 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
       <h2>Connection</h2>
 
       <div className="notice">
-        WALL-E does not broadcast on the network. Its IP address is printed on the
+        {ROBOT_NAME} does not broadcast on the network. Its IP address is printed on the
         serial log at boot. Type it once and the app remembers it.
+      </div>
+      <div className="notice">
+        Link: <strong>{linkModeLabel()}</strong>
+        {direct
+          ? " — this phone opens the socket itself, so no computer needs to be running."
+          : " — a companion server on your computer carries the robot's TCP traffic."}
       </div>
 
       <div className="form-grid">
@@ -165,7 +193,17 @@ export function ConnectionPanel({ notify }: { notify: (m: string, k?: "ok" | "er
         <button className={demoMode ? "on" : ""} onClick={toggleDemo}>
           {demoMode ? "Demo mode: ON" : "Demo mode: OFF"}
         </button>
-        <button className="danger" disabled={connection === "disconnected"} onClick={() => void api.disconnect()}>
+        <button
+          className="danger"
+          disabled={connection === "disconnected"}
+          onClick={() => {
+            if (direct) {
+              disconnectDirect();
+              return;
+            }
+            void api.disconnect();
+          }}
+        >
           Disconnect
         </button>
         <button disabled={connection !== "connected"} onClick={readSensor}>
@@ -253,7 +291,7 @@ export function SettingsPanel({ notify }: { notify: (m: string, k?: "ok" | "err"
       <div className="switch-row">
         <div>
           <strong>Auto reconnect</strong>
-          <div className="hint">Retry with backoff if WALL-E reboots or Wi-Fi drops</div>
+          <div className="hint">Retry with backoff if the robot reboots or Wi-Fi drops</div>
         </div>
         <button
           className="switch"

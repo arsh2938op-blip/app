@@ -9,6 +9,7 @@
  */
 
 import net from "node:net";
+import { ROBOT_NAME } from "../shared/persona.js";
 import {
   CLIFF,
   CMD,
@@ -55,6 +56,8 @@ export class MockRobot {
   private exploreTimer: NodeJS.Timeout | null = null;
   private stateTimer: NodeJS.Timeout | null = null;
   private pendingTextCmd: number | null = null;
+  /** Identity the app assigned us, via the persona frame. */
+  private robotName = ROBOT_NAME;
 
   private cliff: number;
   private groundCm: number;
@@ -236,12 +239,17 @@ export class MockRobot {
 
       // ---- voice, no text frame needed ----
       case CMD.TALK:
-        this.voiceExchange("Hello! I am WALL-E. What can I do for you?");
+        this.voiceExchange("Hello! I am Vulkan, your friendly robot. What shall we do today?");
         this.sendAck(cmd);
         return;
 
       case CMD.JOKE:
         this.voiceExchange("Why did the robot cross the road? To reach the other charging station!");
+        this.sendAck(cmd);
+        return;
+
+      // ---- persona: who the robot is ----
+      case CMD.SET_PERSONA:
         this.sendAck(cmd);
         return;
 
@@ -258,12 +266,30 @@ export class MockRobot {
   }
 
   private onTextFrame(op: number, text: string): void {
+    // The persona arrives as op 0x04. It configures the robot's identity for
+    // Gemini and is never spoken, so it is accepted and stored rather than
+    // treated as a question.
+    if (op === 0x04) {
+      try {
+        const parsed = JSON.parse(text) as { n?: string };
+        if (parsed?.n) this.robotName = String(parsed.n);
+      } catch {
+        // A persona the robot cannot parse is not worth refusing anything
+        // over; it falls back to the compiled-in identity.
+      }
+      return;
+    }
     // Only a reply op from the robot side is expected on this path.
     if (op !== 0x01 && op !== 0x02) return;
     const cmd = this.pendingTextCmd;
     this.pendingTextCmd = null;
     if (cmd === CMD.ASK) this.voiceExchange(this.replyTo(text));
     else this.voiceExchange(text);
+  }
+
+  /** The identity the app told us we are. */
+  get name(): string {
+    return this.robotName;
   }
 
   private handleDrive(cmd: number, held: boolean): void {
@@ -325,12 +351,12 @@ export class MockRobot {
   private replyTo(question: string): string {
     const q = question.toLowerCase();
     if (q.includes("joke")) return "Why did the robot cross the road? To reach the other charging station!";
-    if (q.includes("who") && q.includes("you")) return "I am WALL-E, a compacting robot with a very curious mind!";
+    if (q.includes("who") && q.includes("you")) return "I am Vulkan, a friendly little robot made for kids!";
     if (q.includes("edge") || q.includes("table")) return "My distance sensor watches the floor so I never walk off the edge!";
-    if (q.includes("name")) return "My name is WALL-E!";
-    if (q.includes("hello") || q.includes("hi")) return "Hello there! WALL-E here, ready to roll!";
+    if (q.includes("name")) return "My name is Vulkan!";
+    if (q.includes("hello") || q.includes("hi")) return "Hello there! Vulkan here, ready to have fun!";
     if (q.includes("remote") || q.includes("app")) return "You are talking to me through the app link on port 8080!";
-    return "Beep boop! I heard you. WALL-E is online and ready to explore!";
+    return "Beep boop! I heard you. Vulkan is online and ready to play!";
   }
 
   /* ------------------------------------------------------------ *

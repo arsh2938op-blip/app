@@ -2,6 +2,8 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import net from "node:net";
 import { MockRobot } from "../src/mock/mockRobot.js";
 import { RobotLink } from "../src/server/connection/robotLink.js";
+import { RobotCore, type ByteTransport } from "../src/shared/robotCore.js";
+import { ROBOT_NAME } from "../src/shared/persona.js";
 import {
   APP_TIMEOUT_MS,
   CLIFF,
@@ -13,6 +15,44 @@ import {
   encodePacket,
   type DecodedPacket,
 } from "../src/shared/walleProtocol.js";
+
+/** A minimal ByteTransport over a real socket, for RobotCore-level tests. */
+class NodeTestTransport implements ByteTransport {
+  private socket: net.Socket | null = null;
+  constructor(private readonly onData: (chunk: Uint8Array) => void) {}
+
+  open(host: string, port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const s = new net.Socket();
+      this.socket = s;
+      s.once("error", reject);
+      s.once("connect", () => {
+        s.off("error", reject);
+        s.on("error", () => {});
+        s.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
+        resolve();
+      });
+      s.connect(port, host);
+    });
+  }
+
+  write(bytes: Uint8Array): boolean {
+    if (!this.socket) return false;
+    try {
+      return this.socket.write(Buffer.from(bytes));
+    } catch {
+      return false;
+    }
+  }
+
+  close(): void {
+    const s = this.socket;
+    this.socket = null;
+    if (!s) return;
+    s.removeAllListeners();
+    s.destroy();
+  }
+}
 
 async function until<T>(fn: () => T | undefined | false, timeoutMs: number): Promise<T | undefined> {
   const deadline = Date.now() + timeoutMs;
@@ -171,9 +211,26 @@ describe("RobotLink against the mock robot", () => {
   it("sends ASK followed immediately by a text frame", async () => {
     await connected();
     link.ask("what is your name?");
-    await until(() => seen.length > 2, 1500);
-    const askIdx = seen.findIndex((p) => p.cmd === CMD.ASK);
+    // Wait for the ASK packet itself. Waiting on "some frames arrived" is not
+    // enough, because the persona is now also sent on connect.
+    const askIdx = await until(() => {
+      const i = seen.findIndex((p) => p.cmd === CMD.ASK);
+      return i >= 0 ? i : undefined;
+    }, 2000);
     expect(askIdx).toBeGreaterThanOrEqual(0);
+  });
+
+  it("sends the persona on connect so Vulkan knows who it is", async () => {
+    // The robot owns Gemini, so the personality has to reach the firmware
+    // before the first question rather than being faked in the app.
+    await connected();
+    const persona = await until(
+      () => seen.find((p) => p.cmd === CMD.SET_PERSONA),
+      2000,
+    );
+    expect(persona).toBeDefined();
+    // The robot has taken the identity the app gave it.
+    expect(robot.name).toBe(ROBOT_NAME);
   });
 
   it("speaks a line verbatim", async () => {
@@ -329,32 +386,72 @@ describe("RobotLink against the mock robot", () => {
   });
 
   it("reports a watchdog stop as a notice, not a disconnect", async () => {
-    const l = await connected();
+    // The app going silent while holding an open socket is what the robot's
+    // 700 ms watchdog exists to catch. RobotCore is built directly here so the
+    // keepalive cadence can be pushed out past the watchdog through its
+    // documented option, rather than by reaching into private timers.
+    const robot2 = new MockRobot({ port: 0, host: "127.0.0.1" });
+    const port2 = await robot2.start();
+
     const refusals: number[] = [];
-    l.on("refused", (code) => refusals.push(code));
+    const states: string[] = [];
+    let core!: RobotCore;
 
-    // Drive, then go silent: the robot must stop itself.
-    l.drive(CMD.MOVE_FORWARD, true);
-    await until(() => robot.isDriving, 1500);
+    core = new RobotCore(
+      new NodeTestTransport((chunk) => core.ingest(chunk)),
+      {
+        reconnect: { enabled: false, minDelayMs: 20, maxDelayMs: 40 },
+        // Effectively never re-sends, so the app falls silent.
+        keepalive: { heldMs: 3_600_000, pingMs: 3_600_000 },
+      },
+      {
+        onRefused: (code) => refusals.push(code),
+        onState: (s) => states.push(s),
+      },
+    );
 
-    // Silence the app without tearing the socket down. Replacing the private
-    // method after the timer is armed means the existing interval keeps
-    // firing an empty callback, so no packets reach the robot and the real
-    // 700 ms watchdog expires on its own.
-    const internals = l as unknown as {
-      keepaliveTimer: NodeJS.Timeout | null;
-      startKeepalive: () => void;
-    };
-    if (internals.keepaliveTimer) clearInterval(internals.keepaliveTimer);
-    internals.keepaliveTimer = null;
-    internals.startKeepalive = () => {};
+    core.connect("127.0.0.1", port2);
+    await until(() => core.connectionState === "connected", 3000);
+    expect(core.connectionState).toBe("connected");
 
+    core.drive(CMD.MOVE_FORWARD, true);
+    await until(() => robot2.isDriving, 2000);
+    expect(robot2.isDriving).toBe(true);
+
+    // No further packets are sent, so the robot's own watchdog must fire.
     await until(() => refusals.includes(ERR.LINK_TIMEOUT), 4000);
     expect(refusals).toContain(ERR.LINK_TIMEOUT);
+    expect(robot2.isDriving).toBe(false);
     // The point of the test: a watchdog stop must NOT look like a lost link,
     // because the app is still connected and only needs to resume sending.
+    expect(core.connectionState).toBe("connected");
+    expect(states).not.toContain("disconnected");
+
+    core.disconnect("test cleanup");
+    await robot2.stop();
+  });
+
+it("keeps the connection after a LINK_TIMEOUT", async () => {
+    // The watchdog test above proves the robot really does fire one. This
+    // proves what the app does with it, pinned on the frame itself so it
+    // does not depend on watchdog timing.
+    const l = makeLink(port);
+    const refusals: number[] = [];
+    const blocked: (string | null)[] = [];
+    l.on("refused", (code) => refusals.push(code));
+    l.on("blocked", (reason: string | null) => blocked.push(reason));
+    await until(() => l.connectionState === "connected", 3000);
+
+    l.ingest(
+      encodePacket({ type: MSG_TYPE.STATUS, cmd: ST.ERROR, value: ERR.LINK_TIMEOUT }, 0),
+    );
+
+    expect(refusals).toContain(ERR.LINK_TIMEOUT);
+    expect(blocked[blocked.length - 1]).toMatch(/quiet/i);
+    // A watchdog stop is about US going quiet, not about the link dying, so
+    // the socket must survive it.
     expect(l.connectionState).toBe("connected");
-    expect(robot.isDriving).toBe(false);
+    l.disconnect("test cleanup");
   });
 
   it("reports offline when the robot disappears", async () => {

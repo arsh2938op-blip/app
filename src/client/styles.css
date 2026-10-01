@@ -556,6 +556,66 @@ button.stop:active:not(:disabled) {
   min-width: 0;
 }
 
+/* Mic: wide enough to hit with a thumb, and unmistakable when live. */
+button.mic {
+  min-width: 52px;
+  font-size: 19px;
+  padding: 8px 12px;
+  flex: none;
+}
+button.mic.live {
+  background: rgb(229 72 77 / 0.22);
+  border-color: var(--err);
+  color: #ff9a9e;
+  animation: pulse 1s infinite;
+}
+
+/* Where the answer is coming from. The robot speaks through its own
+   amplifier; the app never makes a sound, and this says so plainly. */
+.speech-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.speech-status.live {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+.eq i {
+  width: 3px;
+  background: var(--ok);
+  border-radius: 1px;
+  animation: eq 0.9s ease-in-out infinite;
+}
+.eq i:nth-child(1) { height: 6px; animation-delay: -0.3s; }
+.eq i:nth-child(2) { height: 13px; animation-delay: -0.15s; }
+.eq i:nth-child(3) { height: 8px; }
+@keyframes eq {
+  50% { transform: scaleY(0.35); }
+}
+
+.credits {
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 0;
+}
+.credits strong {
+  color: var(--accent);
+  letter-spacing: 0.05em;
+}
+
 /* ---------------- activity ---------------- */
 
 .activity {

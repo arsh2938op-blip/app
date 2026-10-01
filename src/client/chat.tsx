@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { ask, speak, useStore } from "../store.js";
-import { timeOf } from "./common.js";
-import type { ActivityEntry } from "../../shared/walleTypes.js";
+import { ask, speak, useStore } from "./store.js";
+import { speech, type SpeechState } from "./speech.js";
+import { ROBOT_NAME } from "../shared/persona.js";
+import { timeOf } from "./ui/common.js";
+import type { ActivityEntry } from "../shared/walleTypes.js";
 
 /**
- * Ask WALL-E a question.
+ * Talk to Vulkan.
  *
- * The robot has no microphone, so speech input is the phone's job and
- * transcription is not available here. Typing sends `ask`, which the robot
- * answers with its own Gemini call and then speaks out loud; the answer comes
- * back as a text frame and lands in the transcript.
+ * Speech in comes from the phone's microphone, because the robot has none.
+ * Speech out is the robot's own: it answers with its Gemini key and speaks
+ * through its amplifier, and the app only displays the text that comes back.
+ * The app never synthesises audio of its own — a second voice would fight the
+ * real one, and the robot's speaker is the thing a demo is meant to show.
  */
 export function ChatPanel() {
   const connected = useStore((s) => s.connection === "connected");
@@ -18,7 +21,10 @@ export function ChatPanel() {
   const state = useStore((s) => s.status?.state);
   const [text, setText] = useState("");
   const [history, setHistory] = useState<string[]>([]);
+  const [speechState, setSpeechState] = useState<SpeechState>(speech.getState());
   const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => speech.subscribe(setSpeechState), []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -32,17 +38,30 @@ export function ChatPanel() {
     setText("");
   };
 
-  const phase =
-    state === "thinking" ? "WALL-E is thinking…" : state === "speaking" ? "WALL-E is speaking…" : null;
+  /** Listen, then send whatever came back as a normal question. */
+  const talk = async () => {
+    const result = await speech.listen();
+    if (result?.text) {
+      const heard = result.text;
+      ask(heard);
+      setHistory((h) => [heard, ...h].filter((v, i, a) => a.indexOf(v) === i).slice(0, 6));
+    }
+  };
+
+  const speaking = state === "speaking";
+  const thinking = state === "thinking";
+  const micBusy = !connected || speaking || thinking || speechState.listening;
+  const micSupported = speechState.availability === "ready";
 
   return (
     <div className="card col-7">
-      <h2>Talk to WALL-E</h2>
+      <h2>Talk to {ROBOT_NAME}</h2>
 
       <div className="chat">
         {chat.length === 0 ? (
           <div className="bubble system">
-            Type a question. WALL-E answers with its own Gemini and says it out loud.
+            Ask {ROBOT_NAME} something, or press the mic and say it out loud. It answers in
+            its own voice and speaks through the robot&apos;s speaker.
           </div>
         ) : (
           chat.map((m) => (
@@ -57,7 +76,7 @@ export function ChatPanel() {
       <div className="composer">
         <input
           value={text}
-          placeholder={connected ? "Ask WALL-E something…" : "Not connected"}
+          placeholder={connected ? `Ask ${ROBOT_NAME} something…` : "Not connected"}
           disabled={!connected}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -68,7 +87,20 @@ export function ChatPanel() {
           Ask
         </button>
         <button
-          disabled={!connected || !text.trim() || !!phase}
+          className={speechState.listening ? "mic live" : "mic"}
+          disabled={micBusy || !micSupported}
+          onClick={talk}
+          title={
+            micSupported
+              ? "Speak to the robot"
+              : speechUnavailableReason(speechState.availability)
+          }
+          aria-label="Speak to the robot"
+        >
+          {speechState.listening ? "●" : "🎤"}
+        </button>
+        <button
+          disabled={!connected || !text.trim() || speaking}
           title="Say this exact line, no AI"
           onClick={() => {
             speak(text.trim());
@@ -79,7 +111,27 @@ export function ChatPanel() {
         </button>
       </div>
 
-      {phase ? <p className="hint">{phase}</p> : null}
+      {/* Where the answer actually comes from. During a demo this is the
+          difference between "the app is broken" and "the robot is speaking". */}
+      <div className={`speech-status${speaking ? " live" : ""}`}>
+        {speaking ? (
+          <>
+            <span className="eq" aria-hidden>
+                <i />
+                <i />
+                <i />
+              </span>
+            Speaking through the robot&apos;s speaker
+          </>
+        ) : thinking ? (
+          "Thinking…"
+        ) : speechState.listening ? (
+          speechState.interim || "Listening…"
+        ) : speechState.error ? (
+          speechState.error
+        ) : null}
+      </div>
+
       {blocked ? <p className="hint warn">{blocked}</p> : null}
 
       {history.length > 0 ? (
@@ -93,6 +145,17 @@ export function ChatPanel() {
       ) : null}
     </div>
   );
+}
+
+function speechUnavailableReason(availability: SpeechState["availability"]): string {
+  switch (availability) {
+    case "no-mic-permission":
+      return "Microphone permission denied — allow it in Settings";
+    case "no-mic":
+      return "Speech input needs Google's speech service on this device";
+    default:
+      return "Speech input is not available here — type instead";
+  }
 }
 
 /**

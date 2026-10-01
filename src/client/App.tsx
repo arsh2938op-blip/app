@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
-import { useStore, loadSettings } from "./store.js";
+import {
+  api,
+  connectDirect,
+  loadSettings,
+  startDirectLink,
+  useStore,
+} from "./store.js";
+import { linkModeLabel } from "./nativeLink.js";
 import { useToast } from "./ui/common.js";
 import { acquireWakeLock } from "./keepAwake.js";
 import { ConnectionPanel, RobotInfoPanel, SettingsPanel } from "./ui/settings.js";
@@ -10,7 +17,8 @@ import {
   TimedMotionPanel,
   VoiceQuickPanel,
 } from "./ui/controls.js";
-import { ActivityPanel, ChatPanel } from "./ui/chat.js";
+import { ActivityPanel, ChatPanel } from "./chat.js";
+import { ROBOT_NAME, CREATORS } from "../shared/persona.js";
 import { ROBOT_STATE } from "../shared/walleProtocol.js";
 
 type Tab = "drive" | "connect" | "settings";
@@ -34,7 +42,6 @@ function stateLabel(code: number, name: string): string {
 export function App() {
   const connection = useStore((s) => s.connection);
   const demoMode = useStore((s) => s.demoMode);
-  const robotName = useStore((s) => s.robotName);
   const status = useStore((s) => s.status);
   const target = useStore((s) => s.target);
   const lastError = useStore((s) => s.lastError);
@@ -45,6 +52,21 @@ export function App() {
   useEffect(() => {
     void loadSettings();
   }, []);
+
+  /**
+   * On the phone, open a raw TCP socket to the robot itself. This is what
+   * makes the app work with no laptop and no companion server.
+   */
+  useEffect(() => {
+    if (!startDirectLink()) return;
+    void api
+      .settings()
+      .then((s) => {
+        if (s.host) connectDirect(s.host, s.port);
+        else notify("Enter the robot's IP on the Connect tab", "err");
+      })
+      .catch(() => notify("Enter the robot's IP on the Connect tab", "err"));
+  }, [notify]);
 
   // A locked screen would make the app go quiet and the robot would stop
   // itself mid-manoeuvre, so keep the display awake while this is visible.
@@ -63,9 +85,10 @@ export function App() {
             ▣
           </div>
           <div>
-            <h1>{robotName}</h1>
+            <h1>{ROBOT_NAME}</h1>
             <div className="hint">
-              {target ? `${target.host}:${target.port}` : "no robot"} · TCP
+              {target ? `${target.host}:${target.port}` : "no robot"} ·{" "}
+              {linkModeLabel()}
             </div>
           </div>
         </div>
@@ -96,6 +119,11 @@ export function App() {
       </header>
 
       {demoMode ? <div className="demo-banner">DEMO MODE — simulated robot, no hardware</div> : null}
+
+      {/* Credits belong on screen at an Innovation Day, not buried in a README. */}
+      <div className="credits">
+        <strong>{ROBOT_NAME}</strong> · by {CREATORS.join(", ")}
+      </div>
 
       {offline && lastError ? (
         <div className="demo-banner offline">

@@ -159,6 +159,7 @@ frames, and stray-byte recovery.
 | `0x17` | `move_steps` | 1–50 steps (`STEP_DISTANCE_CM` = 10 cm) |
 | `0x18` | `turn_around` | — (180°) |
 | `0x1c` | `turn_degrees` | 1–360° |
+| `0x1d` | `set_persona` | **then** a text frame with op `0x04` (see §11) |
 
 No keepalive, and **no `stop` afterwards** — sending one is harmless but
 pointless. Still subject to the cliff sensor.
@@ -209,7 +210,73 @@ Five expressions, not nine. The firmware defines five.
 
 ---
 
-## 5. Status
+## 11. The persona: Vulkan
+
+**The robot is Vulkan, not WALL-E.** The app sends the persona on connect, so
+a build does not have to have it compiled in, and it arrives before the first
+question.
+
+```
+app                                              robot
+ |-- COMMAND set_persona (0x1d) ------------------>|
+ |-- TEXT   op=0x04  {"n":"Vulkan", ...} ---------->|  stores it
+ |<-- ACK   cmd = 0x1d ------------------------------|
+```
+
+The payload is compact JSON, keys single-lettered, because a text frame is
+**240 bytes** and that is the entire budget:
+
+```json
+{"n":"Vulkan","s":"Friend!","m":"happy","p":"You are Vulkan, a friendly robot for kids. Always reply. End every reply with Friend!. Be happy and joyful, never sad. One or two short sentences, no emoji."}
+```
+
+| Key | Meaning |
+|---|---|
+| `n` | the robot's name |
+| `s` | the required suffix on every reply |
+| `m` | mood, always `happy` |
+| `p` | the system prompt for Gemini |
+
+### What the firmware must do with it
+
+1. Store `p` as the Gemini **system instruction**. Everything the child says
+   is then answered in that voice.
+2. Append `s` to every reply before it goes to TTS.
+3. Refuse to accept a persona longer than `WALLE_TEXT_MAX`; a clipped JSON
+   string will not parse and the robot would silently fall back to whatever
+   was compiled in.
+4. `WALLE_CMD_PERSONA` is a normal command: `ACK` it on success, and send
+   `WALLE_ERR_BAD_ARG` if the text frame that follows is not valid JSON or is
+   missing the required keys.
+
+The app sends this **before** `HELLO` completes its reply, and treats a
+`BAD_ARG` refusal as non-fatal: a build with the persona compiled in still
+works, it just ignores the frame.
+
+### Why the app does not synthesise speech
+
+The robot owns the Gemini key, the TTS client and the amplifier. The app
+sends `ask`, the robot answers and speaks, and the answer comes back as a
+`WALLE_OP_REPLY` text frame for the transcript.
+
+The app deliberately has **no text-to-speech of its own**. A second voice would
+fight the real one, and the robot's own speaker is the thing a live demo is
+meant to demonstrate. The UI shows a "speaking through the robot's speaker"
+indicator driven by `ROBOT_STATE_SPEAKING`, so it is obvious where the sound is
+coming from.
+
+### Creators
+
+Aakansh Abhiraj, Arsh Prit, Mayank Arya, Zulkarnain.
+
+The names are **not** in the persona payload. Including all four pushes it to
+297 bytes, over the 240-byte limit, and a clipped JSON string would not parse.
+They belong in the app UI, which shows them, and in the robot's own credits
+line if you want it spoken.
+
+---
+
+## 12. Verifying the app against real hardware
 
 | Id | Name | Carries |
 |---|---|---|

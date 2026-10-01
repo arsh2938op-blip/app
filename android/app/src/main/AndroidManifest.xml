@@ -44,6 +44,17 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!--
+      Microphone: the robot has none, so speech input is captured by the
+      phone. Recognition itself runs on-device via the Web Speech API, so no
+      audio leaves the handset.
+
+      RECORD_AUDIO is a runtime permission, so it is also requested from
+      MainActivity the first time the mic button is pressed.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!--
       Keep the screen on while the app is in the foreground.
 
       This is a safety requirement, not a convenience. The robot stops itself

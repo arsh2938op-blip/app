@@ -474,7 +474,7 @@ export class AppServer {
     level: "debug" | "info" | "warn" | "error",
     label: string,
     kind: ActivityEntry["kind"] = "system",
-    seq?: number,
+    requestId?: string,
     detail?: string,
   ): void {
     const entry: ActivityEntry = {
@@ -484,7 +484,7 @@ export class AppServer {
       label,
       detail,
       level,
-      seq,
+      requestId,
     };
     this.activity.push(entry);
     if (this.activity.length > ACTIVITY_LIMIT) this.activity.shift();

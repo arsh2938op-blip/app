@@ -84,6 +84,14 @@ export const CMD = {
   ASK: 0x1a,
   SPEAK: 0x1b,
   TURN_DEGREES: 0x1c,
+  /**
+   * Announce the persona, then send it as a TEXT frame.
+   *
+   * The robot owns Gemini and the speaker, so the personality has to reach
+   * the firmware rather than being synthesised in the app. Sending it at
+   * runtime means a build does not have to have it compiled in.
+   */
+  SET_PERSONA: 0x1d,
 
   EXPR_HAPPY: 0x20,
   EXPR_THINKING: 0x21,
@@ -121,6 +129,7 @@ export const COMMAND_NAME: Readonly<Record<number, string>> = Object.freeze(
       [CMD.ASK]: "ask",
       [CMD.SPEAK]: "speak",
       [CMD.TURN_DEGREES]: "turn_degrees",
+      [CMD.SET_PERSONA]: "set_persona",
       [CMD.EXPR_HAPPY]: "expression_happy",
       [CMD.EXPR_THINKING]: "expression_thinking",
       [CMD.EXPR_SURPRISED]: "expression_surprised",

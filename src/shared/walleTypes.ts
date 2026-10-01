@@ -70,8 +70,8 @@ export interface ActivityEntry {
   label: string;
   detail?: string;
   level?: ActivityLevel;
-  /** Binary seq of the packet, so a reader can correlate frames. */
-  seq?: number;
+  /** Correlates a command with its response, on the server path. */
+  requestId?: string;
 }
 
 /* ------------------------------------------------------------------ *
